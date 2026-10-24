@@ -120,6 +120,39 @@ jobs:
           run naabu "Naabu schneller Port-Scan (Top 1000 Ports, TCP-Connect) auf $TARGET" -v "$PWD/reports:/reports" projectdiscovery/naabu:latest -host "$TARGET" -top-ports 1000 -s c -rate 500 -silent -json -o /reports/naabu-raw.json
           run sslyze "SSLyze prüft TLS-Versionen, Cipher, Zertifikat, Heartbleed, ROBOT und Renegotiation von $TARGET" -v "$PWD/reports:/reports" python:3.12-slim sh -c "pip install -q sslyze >/dev/null 2>&1; python -m sslyze --json_out=/reports/sslyze-raw.json $TARGET"
           run whatweb "WhatWeb erkennt CMS, Frameworks, Plugins und Skripte (leise, Stufe 1) auf https://$TARGET" -v "$PWD/reports:/reports" debian:stable-slim sh -c "apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq whatweb >/dev/null 2>&1; whatweb -a 1 --log-json=/reports/whatweb-raw.json https://$TARGET"
+          # Subzy: Subdomain-Takeover (nutzt Subfinder-Ergebnis, sonst nur die Hauptdomain)
+          if has subzy; then
+            { echo "$TARGET"; python3 -c 'import json,sys
+          for l in open(sys.argv[1]):
+              try: print(json.loads(l).get("host",""))
+              except Exception: pass' reports/subfinder-raw.json 2>/dev/null; } | sort -u | grep . > reports/subzy-targets.txt
+          fi
+          run subzy "Subzy prüft $(wc -l < reports/subzy-targets.txt 2>/dev/null || echo 1) (Sub-)Domains auf Takeover-Gefahr" -v "$PWD/reports:/reports" golang:1.22-alpine sh -c "go install github.com/PentestPad/subzy@latest >/dev/null 2>&1; /go/bin/subzy run --targets /reports/subzy-targets.txt --hide_fails --https --timeout 15 --output /reports/subzy-raw.json"
+          run cmseek "CMSeeK erkennt CMS (Joomla, Drupal, TYPO3 u. a.) auf https://$TARGET" -v "$PWD/reports:/reports" python:3.12-slim sh -c "apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq git >/dev/null 2>&1; git clone -q --depth 1 https://github.com/Tuhinshubhra/CMSeeK /opt/c && cd /opt/c && pip install -q -r requirements.txt >/dev/null 2>&1; python3 cmseek.py -u https://$TARGET --batch --random-agent; cp Result/*/cms.json /reports/cmseek-raw.json 2>/dev/null || true"
+          # Trufflehog: Startseite + JS-Dateien herunterladen und nach geleakten Schlüsseln durchsuchen
+          if has trufflehog; then
+            python3 - "$TARGET" <<'PY' || true
+          import os, re, sys, urllib.request
+          t = sys.argv[1]; os.makedirs("reports/site", exist_ok=True)
+          def get(u):
+              try: return urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "Taniwha"}), timeout=15).read()[:3000000]
+              except Exception: return b""
+          home = get("https://%s/" % t); open("reports/site/index.html", "wb").write(home)
+          urls = re.findall(r"<script[^>]+src=[\"']([^\"']+)[\"']", home.decode("utf-8", "replace"), re.I)
+          for f in ("reports/js-urls.txt", "reports/katana-urls.txt"):
+              try: urls += [l.strip() for l in open(f, encoding="utf-8", errors="replace") if re.search(r"\.js(\?|$)", l.strip())]
+              except OSError: pass
+          idx = []
+          for i, u in enumerate(list(dict.fromkeys(urls))[:80]):
+              u = u if u.startswith("http") else ("https:" + u if u.startswith("//") else "https://%s/%s" % (t, u.lstrip("/")))
+              b = get(u)
+              if b: open("reports/site/f%03d.js" % i, "wb").write(b); idx.append("f%03d.js\t%s" % (i, u))
+          open("reports/site-index.txt", "w").write("index.html\thttps://%s/\n" % t + "\n".join(idx) + "\n")
+          print("downloaded", len(idx) + 1, "files")
+          PY
+          fi
+          run trufflehog "Trufflehog sucht geleakte Passwörter/API-Schlüssel in Startseite und JavaScript von https://$TARGET" -v "$PWD/reports:/reports" --entrypoint sh trufflesecurity/trufflehog:latest -c "trufflehog filesystem /reports/site --json --no-update > /reports/trufflehog-raw.jsonl; echo \"Treffer: \$(wc -l < /reports/trufflehog-raw.jsonl)\""
+          run feroxbuster "Feroxbuster sucht versteckte Ordner/Dateien (rekursiv Tiefe 2, max. 10 min) auf https://$TARGET" -v "$PWD/reports:/reports" epi052/feroxbuster:latest -u "https://$TARGET" -w /reports/seclists-common.txt -d 2 -t 20 --auto-tune --time-limit 10m -C 404 --silent --json -o /reports/feroxbuster-raw.json
           run nmapvuln "Nmap-Schwachstellen-Skripte (vuln, Top 100 Ports, max. 20 min) auf $TARGET" -v "$PWD/reports:/reports" instrumentisto/nmap -Pn -sV --top-ports 100 --script vuln --host-timeout 20m -oX /reports/nmapvuln-raw.xml "$TARGET"
           run nmap "Nmap Port-/Service-Scan (Top 1000 Ports) auf $TARGET" instrumentisto/nmap -Pn -sV --top-ports 1000 -oX /reports/nmap-report.xml "$TARGET"
           run sqlmap "SQLMap SQL-Injection-Prüfung (Batch, sanft, Crawl Tiefe 1)" -v "$PWD/reports:/reports" parrotsec/sqlmap -u "https://$TARGET" --batch --forms --crawl=1 --crawl-depth=1 --level=1 --risk=1 --output-dir=/reports/sqlmap --flush-session
@@ -452,6 +485,64 @@ jobs:
           except Exception: pass
           seen = set(); f = [x for x in f if not (x["title"] in seen or seen.add(x["title"]))]
           save("whatweb", f)
+          # subzy: Subdomain-Takeover
+          f = []
+          try:
+              raw = json.load(open("reports/subzy-raw.json", encoding="utf-8", errors="replace"))
+              for d in raw if isinstance(raw, list) else [raw]:
+                  if not isinstance(d, dict) or str(d.get("status") or "").lower() != "vulnerable": continue
+                  sub = d.get("subdomain") or d.get("domain") or T
+                  f.append({"title": "Subdomain-Takeover möglich: %s (Subzy)" % sub, "description": "Die Subdomain %s zeigt auf einen Dienst (%s), der offenbar nicht mehr belegt ist. Ein Angreifer könnte ihn übernehmen und unter deiner Domain Inhalte ausliefern." % (sub, d.get("engine") or d.get("service") or "unbekannt"),
+                            "severity": "high", "url": sub if str(sub).startswith("http") else "https://%s" % sub, "evidence": json.dumps(d, ensure_ascii=False, indent=2)[:4000]})
+          except Exception: pass
+          save("subzy", f)
+          # cmseek: CMS-Erkennung
+          f = []
+          try:
+              c = json.load(open("reports/cmseek-raw.json", encoding="utf-8", errors="replace"))
+              if c.get("cms_name"):
+                  f.append(comp(c.get("cms_name"), str(c.get("cms_version") or ""), "CMSeeK", c.get("url") or "https://%s" % T))
+                  extra = {k: v for k, v in c.items() if v and k not in ("cms_name", "cms_version", "cms_url", "cms_id", "url", "last_scanned")}
+                  for k, v in extra.items():
+                      if "vuln" in k.lower():
+                          f.append({"title": "Bekannte CMS-Schwachstellen: %s (CMSeeK)" % c.get("cms_name"), "description": "CMSeeK meldet bekannte Schwachstellen für %s %s." % (c.get("cms_name"), c.get("cms_version") or ""),
+                                    "severity": "high", "url": "https://%s" % T, "evidence": json.dumps(v, ensure_ascii=False, indent=2)[:4000]})
+          except Exception: pass
+          save("cmseek", f)
+          # trufflehog: geleakte Schlüssel
+          f = []; idx = {}
+          try:
+              for l in open("reports/site-index.txt", encoding="utf-8"):
+                  a, _, b = l.strip().partition("\t"); idx[a] = b
+          except OSError: pass
+          seen = set()
+          for d in jl("reports/trufflehog-raw.jsonl"):
+              det = d.get("DetectorName") or "Secret"
+              fs = ((d.get("SourceMetadata") or {}).get("Data") or {}).get("Filesystem") or {}
+              fn = os.path.basename(str(fs.get("file") or ""))
+              red = str(d.get("Redacted") or (d.get("Raw") or "")[:6] + "…")
+              key = (det, fn, red)
+              if key in seen: continue
+              seen.add(key)
+              ok = bool(d.get("Verified"))
+              f.append({"title": "Geleakter Schlüssel: %s%s (Trufflehog)" % (det, " – gültig!" if ok else ""), "description": "In öffentlich abrufbarem Code wurde ein %s-Zugangsschlüssel gefunden.%s" % (det, " Trufflehog hat bestätigt, dass er funktioniert – sofort sperren und neu erzeugen." if ok else " Ob er noch gültig ist, konnte nicht bestätigt werden."),
+                        "severity": "critical" if ok else "medium", "url": idx.get(fn) or "https://%s" % T,
+                        "evidence": "Datei: %s\nZeile: %s\nTyp: %s\nVerifiziert: %s\nAusschnitt (gekürzt): %s" % (idx.get(fn) or fn, fs.get("line"), det, "ja" if ok else "nein", red[:12])})
+          save("trufflehog", f)
+          # feroxbuster: versteckte Pfade
+          f = []; hits = []
+          for d in jl("reports/feroxbuster-raw.json"):
+              if d.get("type") == "response" and d.get("url"): hits.append((d.get("status"), d.get("url"), d.get("content_length")))
+          hits = list(dict.fromkeys(hits))
+          risky = re.compile(r"(\.git|\.env|\.svn|backup|\.bak|\.old|\.sql|\.zip|\.tar|dump|phpinfo|config|admin|debug|\.DS_Store)", re.I)
+          for st, u, ln in hits:
+              if st == 200 and risky.search(urlparse(u).path or ""):
+                  f.append({"title": "Heikle Datei/Ordner erreichbar: %s (Feroxbuster)" % (urlparse(u).path or u), "description": "Feroxbuster hat einen Pfad gefunden, der oft sensible Inhalte enthält (Backups, Konfiguration, Admin-Bereich).",
+                            "severity": "medium", "url": u, "evidence": "URL: %s\nHTTP-Status: %s\nGröße: %s Bytes" % (u, st, ln)})
+          if hits:
+              f.append({"title": "Entdeckte Pfade (Feroxbuster)", "description": "Feroxbuster hat %d erreichbare Pfade gefunden." % len(hits), "severity": "info", "url": "https://%s" % T,
+                        "evidence": "\n".join("%s  %s  (%s B)" % h for h in hits[:300])})
+          save("feroxbuster", f)
           # nmap --script vuln
           f = []
           try:
