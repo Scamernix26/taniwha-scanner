@@ -70,7 +70,21 @@ jobs:
           [ -s "$WLIST" ] || curl -fsSL -o "$WLIST" "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" || true
           run zap "ZAP Full-Scan (Spider + aktive Angriffe, max. 10 min Spider) auf https://$TARGET" -v "$PWD/reports:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable zap-full-scan.py -t "https://$TARGET" -J zap-report.json -m 10
           run nuclei "Nuclei-Templates (critical/high/medium, 50 Req/s) gegen https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/nuclei:latest -u "https://$TARGET" -severity critical,high,medium -jsonl-export /reports/nuclei-report.json -rate-limit 50 -stats -si 30
-          run nikto "Nikto Webserver-Prüfung auf https://$TARGET" -v "$PWD/reports:/reports" frapsoft/nikto -h "https://$TARGET" -Format json -output /reports/nikto-report.json
+          # frapsoft/nikto (2.1.x) kennt kein JSON – CSV schreiben und in das Taniwha-Format umrechnen
+          run nikto "Nikto Webserver-Prüfung auf https://$TARGET" -v "$PWD/reports:/reports" frapsoft/nikto -h "https://$TARGET" -Format csv -output /reports/nikto-report.csv
+          if [ -s reports/nikto-report.csv ]; then
+            python3 - reports/nikto-report.csv > reports/nikto-report.json <<'PY' || true
+          import csv, json, sys
+          out = []
+          for r in csv.reader(open(sys.argv[1], encoding="utf-8", errors="replace")):
+              if len(r) < 7 or not r[6].strip(): continue
+              host, ip, port, nid, method, uri, msg = r[:7]
+              url = f"https://{host}{uri}" if uri.startswith("/") else (uri or f"https://{host}")
+              out.append({"title": msg[:300], "description": msg, "severity": "low", "url": url,
+                          "evidence": f"Anfrage: {method} {url}\nServer: {ip}:{port}\nNikto-ID: {nid}\nMeldung: {msg}"})
+          print(json.dumps({"findings": out}))
+          PY
+          fi
           run testssl "TLS/SSL-Konfiguration von $TARGET" -v "$PWD/reports:/reports" drwetter/testssl.sh:latest --jsonfile /reports/testssl-report.json "$TARGET"
           run ffuf "ffuf Verzeichnis-Entdeckung (SecLists common.txt) auf https://$TARGET" -v "$PWD/reports:/reports" trickest/ffuf -u "https://$TARGET/FUZZ" -w /reports/seclists-common.txt -ac -t 20 -timeout 10 -of json -o /reports/ffuf-report.json
           run nmap "Nmap Port-/Service-Scan (Top 1000 Ports) auf $TARGET" instrumentisto/nmap -Pn -sV --top-ports 1000 -oX /reports/nmap-report.xml "$TARGET"
