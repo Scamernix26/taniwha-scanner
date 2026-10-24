@@ -66,6 +66,13 @@ jobs:
           PY
           }
           ev "" info "Scan-Rechner $(hostname) startet – Ziel $TARGET"
+          # CDN/WAF-Erkennung: Ergebnisse spiegeln dann die Schutzschicht, nicht den Ursprungsserver
+          HDRS=$(curl -sS -I -m 15 "https://$TARGET/" 2>/dev/null | tr 'A-Z' 'a-z' || true)
+          if echo "$HDRS" | grep -qE '^(server: cloudflare|cf-ray:)'; then
+            ev "" warn "Cloudflare erkannt: Port-, TLS- und Infra-Scanner (Nmap, Naabu, OpenVAS, testssl, SSLyze) sehen nur Cloudflare, nicht deinen Server. Web-Scanner können blockiert werden – „0 Treffer“ ist dann wenig aussagekräftig. Tipp: IP des Scan-Rechners in Cloudflare (WAF → IP Access Rules) erlauben."
+          elif echo "$HDRS" | grep -qE '^(x-akamai|x-sucuri-id|x-amz-cf-id|x-served-by: cache|x-cdn)'; then
+            ev "" warn "CDN/WAF vor dem Ziel erkannt: Infra-Scanner sehen nur die Schutzschicht, Web-Scanner können blockiert werden."
+          fi
           # Wortliste für ffuf vorbereiten (einmalig pro Lauf)
           WLIST="$PWD/reports/seclists-common.txt"
           [ -s "$WLIST" ] || curl -fsSL -o "$WLIST" "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" || true
@@ -90,7 +97,7 @@ jobs:
           run ffuf "ffuf Verzeichnis-Entdeckung (SecLists common.txt) auf https://$TARGET" -v "$PWD/reports:/reports" trickest/ffuf -u "https://$TARGET/FUZZ" -w /reports/seclists-common.txt -ac -t 20 -timeout 10 -of json -o /reports/ffuf-report.json
           # --- Web-Assessment: Technik-Inventar, Seitenerkundung, zweiter Vollscanner, XSS, Parameter, JS-Bibliotheken, WordPress ---
           run httpx "httpx Technik-Erkennung (Webserver, Frameworks, CDN) auf https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/httpx:latest -u "https://$TARGET" -td -server -title -ip -cdn -silent -json -o /reports/httpx-raw.json
-          run katana "Katana Seitenerkundung (Tiefe 3, inkl. JavaScript) auf https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/katana:latest -u "https://$TARGET" -d 3 -jc -c 5 -rl 50 -silent -o /reports/katana-urls.txt
+          run katana "Katana Seitenerkundung (Tiefe 3, inkl. JavaScript) auf https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/katana:latest -u "https://$TARGET" -fs fqdn -d 3 -jc -c 5 -rl 50 -silent -o /reports/katana-urls.txt
           run wapiti "Wapiti Webanwendungs-Scan (max. 15 min) auf https://$TARGET" -v "$PWD/reports:/reports" cyberwatch/wapiti -u "https://$TARGET" -f json -o /reports/wapiti-raw.json --flush-session --max-scan-time 900
           run arjun "Arjun sucht versteckte Parameter auf https://$TARGET" -v "$PWD/reports:/reports" python:3.12-slim sh -c "pip install -q arjun >/dev/null 2>&1; arjun -u https://$TARGET -m GET -oJ /reports/arjun-raw.json -t 5 -d 1 -q"
           if has dalfox || has retirejs; then
@@ -101,33 +108,34 @@ jobs:
           try: urls = [l.strip() for l in open("reports/katana-urls.txt", encoding="utf-8", errors="replace") if l.strip()]
           except OSError: pass
           js, params = [], []
+          from urllib.parse import urlparse
+          def same(u):
+              try: return urlparse(u).hostname == target
+              except Exception: return False
+          urls = [u for u in urls if same(u)]
           for u in urls:
               if re.search(r"\.js(\?|$)", u): js.append(u)
               if "?" in u and "=" in u: params.append(u)
           try:
               html = urllib.request.urlopen(urllib.request.Request("https://%s/" % target, headers={"User-Agent": "Taniwha"}), timeout=15).read().decode("utf-8", "replace")
               for m in re.findall(r"<script[^>]+src=[\"']([^\"']+)[\"']", html, re.I):
-                  js.append(m if m.startswith("http") else ("https:" + m if m.startswith("//") else "https://%s/%s" % (target, m.lstrip("/"))))
+                  cand = m if m.startswith("http") else ("https:" + m if m.startswith("//") else "https://%s/%s" % (target, m.lstrip("/")))
+                  if same(cand): js.append(cand)
           except Exception: pass
           open("reports/js-urls.txt", "w").write("\n".join(dict.fromkeys(js))[:20000] + "\n")
           open("reports/dalfox-urls.txt", "w").write("\n".join(dict.fromkeys(params[:50] or ["https://%s/" % target])) + "\n")
           PY
           fi
-          run dalfox "Dalfox XSS-Prüfung der entdeckten Seiten mit Parametern" -v "$PWD/reports:/reports" hahwul/dalfox:latest file /reports/dalfox-urls.txt --silence --format json -o /reports/dalfox-report.json
-          run retirejs "retire.js prüft die eingebundenen JavaScript-Bibliotheken auf bekannte Lücken" -v "$PWD/reports:/reports" node:20-alpine sh -c 'npm i -g retire >/dev/null 2>&1; : > /reports/retirejs-raw.jsonl; while read -r u; do [ -n "$u" ] || continue; rm -f /tmp/r.json; retire --jsuri "$u" --outputformat json --outputpath /tmp/r.json --exitwith 0 >/dev/null 2>&1; [ -s /tmp/r.json ] && echo "{\"uri\":\"$u\",\"retire\":$(cat /tmp/r.json)}" >> /reports/retirejs-raw.jsonl; done < /reports/js-urls.txt'
+          run dalfox "Dalfox XSS-Prüfung der entdeckten Seiten mit Parametern" -v "$PWD/reports:/reports" hahwul/dalfox:latest dalfox file /reports/dalfox-urls.txt --silence --format json -o /reports/dalfox-report.json
+          run retirejs "retire.js prüft die eingebundenen JavaScript-Bibliotheken auf bekannte Lücken" -v "$PWD/reports:/reports" node:20-alpine sh -c 'npm i -g retire >/dev/null 2>&1; : > /reports/retirejs-raw.jsonl; while read -r u; do [ -n "$u" ] || continue; rm -f /tmp/r.json; retire --jsuri "$u" --outputformat json --outputpath /tmp/r.json --exitwith 0 >/dev/null 2>&1; [ -s /tmp/r.json ] && echo "{\"uri\":\"$u\",\"retire\":$(cat /tmp/r.json)}" >> /reports/retirejs-raw.jsonl; true; done < /reports/js-urls.txt; true'
           run wpscan "WPScan prüft WordPress-Version, Theme und Plugins (nur passiv) auf https://$TARGET" -e WPSCAN_API_TOKEN -v "$PWD/reports:/reports" wpscanteam/wpscan --url "https://$TARGET" --no-update --random-user-agent --plugins-detection passive -e vp,vt -f json -o /reports/wpscan-raw.json
           run subfinder "Subfinder sucht Subdomains von $TARGET (passiv über öffentliche Quellen)" -v "$PWD/reports:/reports" projectdiscovery/subfinder:latest -d "$TARGET" -silent -oJ -o /reports/subfinder-raw.json
           run naabu "Naabu schneller Port-Scan (Top 1000 Ports, TCP-Connect) auf $TARGET" -v "$PWD/reports:/reports" projectdiscovery/naabu:latest -host "$TARGET" -top-ports 1000 -s c -rate 500 -silent -json -o /reports/naabu-raw.json
           run sslyze "SSLyze prüft TLS-Versionen, Cipher, Zertifikat, Heartbleed, ROBOT und Renegotiation von $TARGET" -v "$PWD/reports:/reports" python:3.12-slim sh -c "pip install -q sslyze >/dev/null 2>&1; python -m sslyze --json_out=/reports/sslyze-raw.json $TARGET"
           run whatweb "WhatWeb erkennt CMS, Frameworks, Plugins und Skripte (leise, Stufe 1) auf https://$TARGET" -v "$PWD/reports:/reports" debian:stable-slim sh -c "apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq whatweb >/dev/null 2>&1; whatweb -a 1 --log-json=/reports/whatweb-raw.json https://$TARGET"
-          # Subzy: Subdomain-Takeover (nutzt Subfinder-Ergebnis, sonst nur die Hauptdomain)
-          if has subzy; then
-            { echo "$TARGET"; python3 -c 'import json,sys
-          for l in open(sys.argv[1]):
-              try: print(json.loads(l).get("host",""))
-              except Exception: pass' reports/subfinder-raw.json 2>/dev/null; } | sort -u | grep . > reports/subzy-targets.txt
-          fi
-          run subzy "Subzy prüft $(wc -l < reports/subzy-targets.txt 2>/dev/null || echo 1) (Sub-)Domains auf Takeover-Gefahr" -v "$PWD/reports:/reports" golang:1.22-alpine sh -c "go install github.com/PentestPad/subzy@latest >/dev/null 2>&1; /go/bin/subzy run --targets /reports/subzy-targets.txt --hide_fails --https --timeout 15 --output /reports/subzy-raw.json"
+          # Subzy: nur der freigegebene Host; entdeckte Subdomains sind nicht automatisch im Scope
+          if has subzy; then echo "$TARGET" > reports/subzy-targets.txt; fi
+          run subzy "Subzy prüft $(wc -l < reports/subzy-targets.txt 2>/dev/null || echo 1) (Sub-)Domains auf Takeover-Gefahr" -v "$PWD/reports:/reports" golang:alpine sh -c "apk add -q git >/dev/null 2>&1; go install github.com/PentestPad/subzy@latest || exit 3; /go/bin/subzy run --targets /reports/subzy-targets.txt --hide_fails --https --timeout 15 --output /reports/subzy-raw.json"
           run cmseek "CMSeeK erkennt CMS (Joomla, Drupal, TYPO3 u. a.) auf https://$TARGET" -v "$PWD/reports:/reports" python:3.12-slim sh -c "apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq git >/dev/null 2>&1; git clone -q --depth 1 https://github.com/Tuhinshubhra/CMSeeK /opt/c && cd /opt/c && pip install -q -r requirements.txt >/dev/null 2>&1; python3 cmseek.py -u https://$TARGET --batch --random-agent; cp Result/*/cms.json /reports/cmseek-raw.json 2>/dev/null || true"
           # Trufflehog: Startseite + JS-Dateien herunterladen und nach geleakten Schlüsseln durchsuchen
           if has trufflehog; then
@@ -143,8 +151,10 @@ jobs:
               try: urls += [l.strip() for l in open(f, encoding="utf-8", errors="replace") if re.search(r"\.js(\?|$)", l.strip())]
               except OSError: pass
           idx = []
+          from urllib.parse import urlparse
           for i, u in enumerate(list(dict.fromkeys(urls))[:80]):
               u = u if u.startswith("http") else ("https:" + u if u.startswith("//") else "https://%s/%s" % (t, u.lstrip("/")))
+              if urlparse(u).hostname != t: continue  # nur der freigegebene Host, keine Drittanbieter
               b = get(u)
               if b: open("reports/site/f%03d.js" % i, "wb").write(b); idx.append("f%03d.js\t%s" % (i, u))
           open("reports/site-index.txt", "w").write("index.html\thttps://%s/\n" % t + "\n".join(idx) + "\n")
