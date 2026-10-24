@@ -1,5 +1,5 @@
 # Place at .github/workflows/scan.yml in the scanner repository.
-# Repository secrets: PLATFORM_INGEST_URL (…/api/public/ingest-results), RUNNER_INGEST_SECRET
+# Repository secrets: PLATFORM_INGEST_URL (…/api/public/ingest-results), RUNNER_INGEST_SECRET, optional OPENVAS_PASSWORD
 name: Security Scan
 run-name: Scan ${{ inputs.scan_id }} – ${{ inputs.target_domain }}
 on:
@@ -19,6 +19,7 @@ jobs:
       SCAN_ID: ${{ inputs.scan_id }}
       TARGET: ${{ inputs.target_domain }}
       TOOLS: ${{ inputs.tools }}
+      OPENVAS_PASSWORD: ${{ secrets.OPENVAS_PASSWORD }}
     steps:
       - name: Validate inputs (no shell injection)
         run: |
@@ -47,14 +48,64 @@ jobs:
             if docker run --rm --name "taniwha-$SCAN_ID-$t" "$@"; then ev "$t" ok "Fertig nach $((SECONDS-s)) s"; else ev "$t" warn "Beendet mit Fehlercode nach $((SECONDS-s)) s"; fi
           }
           ev "" info "Scan-Rechner $(hostname) startet – Ziel $TARGET"
+          # Wortliste für ffuf vorbereiten (einmalig pro Lauf)
+          WLIST="$PWD/reports/seclists-common.txt"
+          [ -s "$WLIST" ] || curl -fsSL -o "$WLIST" "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" || true
           run zap "ZAP Full-Scan (Spider + aktive Angriffe, max. 10 min Spider) auf https://$TARGET" -v "$PWD/reports:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable zap-full-scan.py -t "https://$TARGET" -J zap-report.json -m 10
           run nuclei "Nuclei-Templates (critical/high/medium, 50 Req/s) gegen https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/nuclei:latest -u "https://$TARGET" -severity critical,high,medium -jsonl-export /reports/nuclei-report.json -rate-limit 50
           run nikto "Nikto Webserver-Prüfung auf https://$TARGET" -v "$PWD/reports:/reports" frapsoft/nikto -h "https://$TARGET" -Format json -output /reports/nikto-report.json
           run testssl "TLS/SSL-Konfiguration von $TARGET" -v "$PWD/reports:/reports" drwetter/testssl.sh:latest --jsonfile /reports/testssl-report.json "$TARGET"
+          run ffuf "ffuf Verzeichnis-Entdeckung (SecLists common.txt) auf https://$TARGET" -v "$PWD/reports:/reports" trickest/ffuf -u "https://$TARGET/FUZZ" -w /reports/seclists-common.txt -ac -t 20 -timeout 10 -of json -o /reports/ffuf-report.json
+          run nmap "Nmap Port-/Service-Scan (Top 1000 Ports) auf $TARGET" instrumentisto/nmap -Pn -sV --top-ports 1000 -oX /reports/nmap-report.xml "$TARGET"
+          run sqlmap "SQLMap SQL-Injection-Prüfung (Batch, sanft, Crawl Tiefe 1)" -v "$PWD/reports:/reports" parrotsec/sqlmap -u "https://$TARGET" --batch --forms --crawl=1 --crawl-depth=1 --level=1 --risk=1 --output-dir=/reports/sqlmap --flush-session
           run trivy "Trivy Abhängigkeits-/Image-Scan" -v "$PWD:/repo" -v "$PWD/reports:/reports" aquasec/trivy:latest fs --format json --output /reports/trivy-report.json /repo
           run semgrep "Semgrep Code-Analyse" -v "$PWD:/src" -v "$PWD/reports:/reports" returntocorp/semgrep:latest semgrep scan --config auto --json --output /reports/semgrep-report.json /src
           run gitleaks "Gitleaks Secret-Suche" -v "$PWD:/repo" -v "$PWD/reports:/reports" zricethezav/gitleaks:latest detect --source /repo --report-format json --report-path /reports/gitleaks-report.json
           run depcheck "OWASP Dependency-Check" -v "$PWD:/src" -v "$PWD/reports:/reports" owasp/dependency-check:latest --project App --scan /src --format JSON --out /reports
+          run syft "Syft SBOM-Katalog (Workspace)" --user root -v "$PWD:/repo" -v "$PWD/reports:/reports" anchore/syft:latest dir:/repo -o syft-json=/reports/syft-report.json
+          # OpenVAS (Greenbone) – läuft als dauerhafter Container "openvas"; Feeds werden beim ersten Start geladen (30–60 min)
+          if has openvas; then
+            OV_PW="${OPENVAS_PASSWORD:-taniwha-openvas-local}"
+            gmp() { docker exec -u gvmd openvas gvm-cli --gmp-username admin --gmp-password "$OV_PW" socket --socketpath /run/gvmd/gvmd.sock --xml "$1"; }
+            id_of() { grep -o 'id="[^"]*"' | head -1 | cut -d'"' -f2; }
+            s=$SECONDS
+            ev openvas info "Startet: OpenVAS-Vollscan (Greenbone) auf $TARGET"
+            if ! docker ps -a --format '{{.Names}}' | grep -qx openvas; then
+              ev openvas info "Erster Start: OpenVAS-Container wird angelegt (lädt Schwachstellen-Feeds, kann 30–60 min dauern)"
+              docker run -d --name openvas --restart unless-stopped -p 127.0.0.1:9392:9392 -e PASSWORD="$OV_PW" -v openvas-data:/data immauss/openvas:latest >/dev/null || ev openvas warn "OpenVAS-Container konnte nicht gestartet werden"
+            else
+              docker start openvas >/dev/null 2>&1 || true
+            fi
+            ready=0
+            for i in $(seq 1 540); do
+              if gmp "<get_configs config_id='daba56c8-73ec-11df-a475-002264764cea'/>" 2>/dev/null | grep -q 'status="200"'; then ready=1; break; fi
+              [ $((i % 30)) -eq 0 ] && ev openvas info "Wartet auf OpenVAS-Feeds ($((i/6)) min) …"
+              sleep 10
+            done
+            if [ "$ready" -ne 1 ]; then
+              ev openvas warn "OpenVAS wurde in 90 min nicht bereit – übersprungen (Feeds laden noch; beim nächsten Scan erneut versuchen)"
+            else
+              tgt=$(gmp "<create_target><name>T-$SCAN_ID</name><hosts>$TARGET</hosts><port_list id='33d0cd82-57c6-11e1-8ed1-406186ea4fc5'/></create_target>" | id_of)
+              tsk=$(gmp "<create_task><name>S-$SCAN_ID</name><config id='daba56c8-73ec-11df-a475-002264764cea'/><target id='$tgt'/><scanner id='08b69003-5fc2-4037-a479-93b440211c73'/></create_task>" | id_of)
+              echo "$tsk" > reports/openvas-task-id
+              rid=$(gmp "<start_task task_id='$tsk'/>" | sed -n 's:.*<report_id>\([^<]*\)</report_id>.*:\1:p' | head -1)
+              if [ -z "$tsk" ] || [ -z "$rid" ]; then
+                ev openvas warn "OpenVAS-Aufgabe konnte nicht gestartet werden"
+              else
+                ev openvas info "OpenVAS-Scan läuft (Task $tsk) – prüft alle 30 s den Fortschritt"
+                state=""
+                for i in $(seq 1 240); do
+                  state=$(gmp "<get_tasks task_id='$tsk'/>" | sed -n 's:.*<status>\([^<]*\)</status>.*:\1:p' | head -1)
+                  prog=$(gmp "<get_tasks task_id='$tsk'/>" | sed -n 's:.*<progress>\([^<]*\)</progress>.*:\1:p' | head -1)
+                  [ $((i % 10)) -eq 0 ] && ev openvas info "OpenVAS: Status $state, Fortschritt ${prog:-?} %"
+                  case "$state" in Done|Stopped|Interrupted) break;; esac
+                  sleep 30
+                done
+                gmp "<get_reports report_id='$rid' format_id='a994b278-1f62-11e1-96ac-406186ea4fc5' details='1' ignore_pagination='1' filter='levels=hmlg rows=-1 min_qod=30'/>" > reports/openvas-report.xml || true
+                ev openvas ok "OpenVAS beendet (Status $state) nach $((SECONDS-s)) s"
+              fi
+            fi
+          fi
           ev "" info "Alle Tools durchgelaufen – sende Reports"
 
       # Runs also after a cancel from Taniwha: stop leftover containers, then hand in whatever was produced so far.
@@ -63,6 +114,93 @@ jobs:
         run: |
           ids=$(docker ps -q --filter "name=taniwha-$SCAN_ID-")
           [ -n "$ids" ] && docker rm -f $ids || true
+          # OpenVAS-Task bei Abbruch stoppen (der Container selbst bleibt bestehen)
+          if [ -s reports/openvas-task-id ]; then
+            docker exec -u gvmd openvas gvm-cli --gmp-username admin --gmp-password "${OPENVAS_PASSWORD:-taniwha-openvas-local}" socket --socketpath /run/gvmd/gvmd.sock --xml "<stop_task task_id='$(cat reports/openvas-task-id)'/>" >/dev/null 2>&1 || true
+          fi
+
+      - name: Convert nmap/sqlmap reports to JSON
+        if: always()
+        run: |
+          command -v python3 >/dev/null 2>&1 || { echo "python3 fehlt – Konvertierung übersprungen"; exit 0; }
+          python3 - <<'PYEOF'
+          import glob, json, re
+          import xml.etree.ElementTree as ET
+          nmap_findings = []
+          sqlmap_findings = []
+          try:
+              root = ET.parse("reports/nmap-report.xml").getroot()
+              for host in root.iter("host"):
+                  addr = host.find("address")
+                  ip = addr.get("addr") if addr is not None else ""
+                  for port in host.iter("port"):
+                      st = port.find("state")
+                      if st is None or st.get("state") != "open":
+                          continue
+                      svc = port.find("service")
+                      name = (svc.get("name") if svc is not None else "") or "unknown"
+                      ver = " ".join(filter(None, [(svc.get(a) if svc is not None else "") for a in ("product", "version", "extrainfo")]))
+                      nmap_findings.append({
+                          "title": "Offener Port %s/%s (%s)" % (port.get("portid"), port.get("protocol"), name),
+                          "description": "Host %s: %s" % (ip, ver or name),
+                          "severity": "info",
+                          "url": "%s:%s" % (ip, port.get("portid")),
+                      })
+          except Exception:
+              pass
+          pat = re.compile(r"parameter '([^']+)' .*(injectable|vulnerable|injected)", re.I)
+          for log in glob.glob("reports/sqlmap/**/log", recursive=True):
+              try:
+                  with open(log, encoding="utf-8", errors="replace") as fh:
+                      for line in fh:
+                          m = pat.search(line)
+                          if m:
+                              sqlmap_findings.append({
+                                  "title": "SQL-Injection: Parameter '%s' (SQLMap)" % m.group(1),
+                                  "description": line.strip()[:500],
+                                  "severity": "critical",
+                              })
+              except Exception:
+                  pass
+          ov_findings = []
+          try:
+              oroot = ET.parse("reports/openvas-report.xml").getroot()
+              for res in oroot.iter("result"):
+                  if res.find("name") is None:
+                      continue
+                  def tx(el, tag):
+                      e = el.find(tag)
+                      return (e.text or "").strip() if e is not None and e.text else ""
+                  try:
+                      sev_n = float(tx(res, "severity") or 0)
+                  except ValueError:
+                      sev_n = 0.0
+                  sev = "critical" if sev_n >= 9 else "high" if sev_n >= 7 else "medium" if sev_n >= 4 else "low" if sev_n > 0 else "info"
+                  host = tx(res, "host")
+                  port = tx(res, "port")
+                  ov_findings.append({
+                      "title": "%s (OpenVAS)" % tx(res, "name"),
+                      "description": (tx(res, "description") or tx(res, "threat"))[:1500],
+                      "severity": sev,
+                      "url": ("%s %s" % (host, port)).strip(),
+                  })
+          except Exception:
+              pass
+          if ov_findings:
+              with open("reports/openvas-report.json", "w") as fh:
+                  json.dump({"findings": ov_findings}, fh)
+              print("converted %d openvas findings" % len(ov_findings))
+          if nmap_findings:
+              with open("reports/nmap-report.json", "w") as fh:
+                  json.dump({"findings": nmap_findings}, fh)
+              print("converted %d nmap findings" % len(nmap_findings))
+          if sqlmap_findings:
+              with open("reports/sqlmap-report.json", "w") as fh:
+                  json.dump({"findings": sqlmap_findings}, fh)
+              print("converted %d sqlmap findings" % len(sqlmap_findings))
+          if not nmap_findings and not sqlmap_findings:
+              print("no nmap/sqlmap findings to convert")
+          PYEOF
 
       - name: Ingest reports
         if: always()
