@@ -49,7 +49,7 @@ jobs:
             echo "\$ docker run --rm --name taniwha-$SCAN_ID-$t $*" > "reports/logs/$t.log"
             docker run --rm --name "taniwha-$SCAN_ID-$t" "$@" >> "reports/logs/$t.log" 2>&1 || rc=$?
             local dur=$((SECONDS-s))
-            if [ $rc -eq 0 ]; then ev "$t" ok "Fertig nach $dur s"; else ev "$t" warn "Beendet mit Fehlercode $rc nach $dur s"; fi
+            if [ $rc -eq 0 ]; then ev "$t" ok "Fertig nach $dur s"; elif [ "$t" = zap ] && [ $rc -le 2 ]; then ev "$t" ok "Fertig nach $dur s (ZAP-Code $rc = Auffälligkeiten gefunden, kein Fehler)"; else ev "$t" warn "Beendet mit Fehlercode $rc nach $dur s"; fi
             runlog "$t" "docker run $*" "$rc" "$dur"
           }
           runlog() { # runlog <tool> <command> <exit> <seconds>  – full server log for the Taniwha UI
