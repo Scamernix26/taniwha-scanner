@@ -20,6 +20,7 @@ jobs:
       TARGET: ${{ inputs.target_domain }}
       TOOLS: ${{ inputs.tools }}
       OPENVAS_PASSWORD: ${{ secrets.OPENVAS_PASSWORD }}
+      WPSCAN_API_TOKEN: ${{ secrets.WPSCAN_API_TOKEN }}
     steps:
       - name: Validate inputs (no shell injection)
         run: |
@@ -87,6 +88,39 @@ jobs:
           fi
           run testssl "TLS/SSL-Konfiguration von $TARGET" -v "$PWD/reports:/reports" drwetter/testssl.sh:latest --jsonfile /reports/testssl-report.json "$TARGET"
           run ffuf "ffuf Verzeichnis-Entdeckung (SecLists common.txt) auf https://$TARGET" -v "$PWD/reports:/reports" trickest/ffuf -u "https://$TARGET/FUZZ" -w /reports/seclists-common.txt -ac -t 20 -timeout 10 -of json -o /reports/ffuf-report.json
+          # --- Web-Assessment: Technik-Inventar, Seitenerkundung, zweiter Vollscanner, XSS, Parameter, JS-Bibliotheken, WordPress ---
+          run httpx "httpx Technik-Erkennung (Webserver, Frameworks, CDN) auf https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/httpx:latest -u "https://$TARGET" -td -server -title -ip -cdn -silent -json -o /reports/httpx-raw.json
+          run katana "Katana Seitenerkundung (Tiefe 3, inkl. JavaScript) auf https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/katana:latest -u "https://$TARGET" -d 3 -jc -c 5 -rl 50 -silent -o /reports/katana-urls.txt
+          run wapiti "Wapiti Webanwendungs-Scan (max. 15 min) auf https://$TARGET" -v "$PWD/reports:/reports" cyberwatch/wapiti -u "https://$TARGET" -f json -o /reports/wapiti-raw.json --flush-session --max-scan-time 900
+          run arjun "Arjun sucht versteckte Parameter auf https://$TARGET" -v "$PWD/reports:/reports" python:3.12-slim sh -c "pip install -q arjun >/dev/null 2>&1; arjun -u https://$TARGET -m GET -oJ /reports/arjun-raw.json -t 5 -d 1 -q"
+          if has dalfox || has retirejs; then
+            python3 - "$TARGET" <<'PY' || true
+          import re, sys, urllib.request
+          target = sys.argv[1]
+          urls = []
+          try: urls = [l.strip() for l in open("reports/katana-urls.txt", encoding="utf-8", errors="replace") if l.strip()]
+          except OSError: pass
+          js, params = [], []
+          for u in urls:
+              if re.search(r"\.js(\?|$)", u): js.append(u)
+              if "?" in u and "=" in u: params.append(u)
+          try:
+              html = urllib.request.urlopen(urllib.request.Request("https://%s/" % target, headers={"User-Agent": "Taniwha"}), timeout=15).read().decode("utf-8", "replace")
+              for m in re.findall(r"<script[^>]+src=[\"']([^\"']+)[\"']", html, re.I):
+                  js.append(m if m.startswith("http") else ("https:" + m if m.startswith("//") else "https://%s/%s" % (target, m.lstrip("/"))))
+          except Exception: pass
+          open("reports/js-urls.txt", "w").write("\n".join(dict.fromkeys(js))[:20000] + "\n")
+          open("reports/dalfox-urls.txt", "w").write("\n".join(dict.fromkeys(params[:50] or ["https://%s/" % target])) + "\n")
+          PY
+          fi
+          run dalfox "Dalfox XSS-Prüfung der entdeckten Seiten mit Parametern" -v "$PWD/reports:/reports" hahwul/dalfox:latest file /reports/dalfox-urls.txt --silence --format json -o /reports/dalfox-report.json
+          run retirejs "retire.js prüft die eingebundenen JavaScript-Bibliotheken auf bekannte Lücken" -v "$PWD/reports:/reports" node:20-alpine sh -c 'npm i -g retire >/dev/null 2>&1; : > /reports/retirejs-raw.jsonl; while read -r u; do [ -n "$u" ] || continue; rm -f /tmp/r.json; retire --jsuri "$u" --outputformat json --outputpath /tmp/r.json --exitwith 0 >/dev/null 2>&1; [ -s /tmp/r.json ] && echo "{\"uri\":\"$u\",\"retire\":$(cat /tmp/r.json)}" >> /reports/retirejs-raw.jsonl; done < /reports/js-urls.txt'
+          run wpscan "WPScan prüft WordPress-Version, Theme und Plugins (nur passiv) auf https://$TARGET" -e WPSCAN_API_TOKEN -v "$PWD/reports:/reports" wpscanteam/wpscan --url "https://$TARGET" --no-update --random-user-agent --plugins-detection passive -e vp,vt -f json -o /reports/wpscan-raw.json
+          run subfinder "Subfinder sucht Subdomains von $TARGET (passiv über öffentliche Quellen)" -v "$PWD/reports:/reports" projectdiscovery/subfinder:latest -d "$TARGET" -silent -oJ -o /reports/subfinder-raw.json
+          run naabu "Naabu schneller Port-Scan (Top 1000 Ports, TCP-Connect) auf $TARGET" -v "$PWD/reports:/reports" projectdiscovery/naabu:latest -host "$TARGET" -top-ports 1000 -s c -rate 500 -silent -json -o /reports/naabu-raw.json
+          run sslyze "SSLyze prüft TLS-Versionen, Cipher, Zertifikat, Heartbleed, ROBOT und Renegotiation von $TARGET" -v "$PWD/reports:/reports" python:3.12-slim sh -c "pip install -q sslyze >/dev/null 2>&1; python -m sslyze --json_out=/reports/sslyze-raw.json $TARGET"
+          run whatweb "WhatWeb erkennt CMS, Frameworks, Plugins und Skripte (leise, Stufe 1) auf https://$TARGET" -v "$PWD/reports:/reports" debian:stable-slim sh -c "apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq whatweb >/dev/null 2>&1; whatweb -a 1 --log-json=/reports/whatweb-raw.json https://$TARGET"
+          run nmapvuln "Nmap-Schwachstellen-Skripte (vuln, Top 100 Ports, max. 20 min) auf $TARGET" -v "$PWD/reports:/reports" instrumentisto/nmap -Pn -sV --top-ports 100 --script vuln --host-timeout 20m -oX /reports/nmapvuln-raw.xml "$TARGET"
           run nmap "Nmap Port-/Service-Scan (Top 1000 Ports) auf $TARGET" instrumentisto/nmap -Pn -sV --top-ports 1000 -oX /reports/nmap-report.xml "$TARGET"
           run sqlmap "SQLMap SQL-Injection-Prüfung (Batch, sanft, Crawl Tiefe 1)" -v "$PWD/reports:/reports" parrotsec/sqlmap -u "https://$TARGET" --batch --forms --crawl=1 --crawl-depth=1 --level=1 --risk=1 --output-dir=/reports/sqlmap --flush-session
           run trivy "Trivy Abhängigkeits-/Image-Scan" -v "$PWD:/repo" -v "$PWD/reports:/reports" aquasec/trivy:latest fs --format json --output /reports/trivy-report.json /repo
@@ -231,6 +265,212 @@ jobs:
               print("converted %d sqlmap findings" % len(sqlmap_findings))
           if not nmap_findings and not sqlmap_findings:
               print("no nmap/sqlmap findings to convert")
+          PYEOF
+
+      - name: Convert web-assessment reports to JSON
+        if: always()
+        run: |
+          command -v python3 >/dev/null 2>&1 || exit 0
+          python3 - <<'PYEOF'
+          import json, os, re
+          import xml.etree.ElementTree as ET
+          from urllib.parse import urlparse
+          T = os.environ.get("TARGET", "")
+          def save(tool, items):
+              if items:
+                  json.dump({"findings": items}, open("reports/%s-report.json" % tool, "w"))
+                  print("converted %d %s findings" % (len(items), tool))
+          def comp(name, ver, src, where):
+              n = (name or "").strip(); v = (ver or "").strip()
+              return {"title": ("Komponente: %s %s" % (n, v)).strip(), "description": "Erkannt durch %s auf %s" % (src, where),
+                      "severity": "info", "url": "https://%s" % T, "evidence": "Komponente: %s\nVersion: %s\nErkannt durch: %s\nFundstelle: %s" % (n, v or "unbekannt", src, where)}
+          def jl(path):
+              out = []
+              try:
+                  for line in open(path, encoding="utf-8", errors="replace"):
+                      line = line.strip()
+                      if line:
+                          try: out.append(json.loads(line))
+                          except ValueError: pass
+              except OSError: pass
+              return out
+          # httpx: Technik-Inventar
+          f = []
+          for d in jl("reports/httpx-raw.json"):
+              where = d.get("url") or T
+              for t in d.get("tech") or []:
+                  name, _, ver = str(t).partition(":")
+                  f.append(comp(name, ver, "httpx", where))
+              if d.get("webserver"):
+                  m = re.match(r"([^/ ]+)[/ ]?(.*)", str(d["webserver"]))
+                  f.append(comp("Webserver " + m.group(1), m.group(2), "httpx (Server-Header)", where))
+              if d.get("cdn_name"): f.append(comp("CDN " + str(d["cdn_name"]), "", "httpx", where))
+          seen = set(); f = [x for x in f if not (x["title"] in seen or seen.add(x["title"]))]
+          save("httpx", f)
+          # katana: entdeckte Seiten
+          try:
+              urls = list(dict.fromkeys(l.strip() for l in open("reports/katana-urls.txt", encoding="utf-8", errors="replace") if l.strip()))
+          except OSError: urls = []
+          if urls:
+              withp = [u for u in urls if "?" in u]
+              save("katana", [{"title": "Entdeckte Seiten und Endpunkte (Katana)", "description": "Katana hat %d URLs gefunden, davon %d mit Parametern." % (len(urls), len(withp)),
+                               "severity": "info", "url": "https://%s" % T, "evidence": "Anzahl URLs: %d\nMit Parametern: %d\n\n%s" % (len(urls), len(withp), "\n".join(urls[:150]))}])
+          # wapiti
+          f = []
+          try:
+              w = json.load(open("reports/wapiti-raw.json", encoding="utf-8", errors="replace"))
+              lvl = {1: "low", 2: "medium", 3: "high", 4: "critical"}
+              for cat, arr in (w.get("vulnerabilities") or {}).items():
+                  for v in arr or []:
+                      f.append({"title": "%s (Wapiti)" % cat, "description": str(v.get("info") or cat), "severity": lvl.get(v.get("level"), "medium"),
+                                "url": "https://%s%s" % (T, v.get("path") or "") if str(v.get("path") or "").startswith("/") else (v.get("path") or "https://%s" % T),
+                                "parameter": v.get("parameter") or None,
+                                "evidence": "Anfrage:\n%s\n\nTest: %s\nParameter: %s\nRegelwerk: %s" % (v.get("http_request") or "", v.get("curl_command") or v.get("info"), v.get("parameter"), ", ".join(v.get("wstg") or []))})
+              for cat, arr in (w.get("anomalies") or {}).items():
+                  for v in arr or []:
+                      f.append({"title": "%s (Wapiti, Auffälligkeit)" % cat, "description": str(v.get("info") or cat), "severity": "low", "url": v.get("path") or None, "parameter": v.get("parameter") or None,
+                                "evidence": "Anfrage:\n%s\n\n%s" % (v.get("http_request") or "", v.get("info") or "")})
+          except Exception: pass
+          save("wapiti", f)
+          # arjun
+          f = []
+          try:
+              a = json.load(open("reports/arjun-raw.json", encoding="utf-8", errors="replace"))
+              items = a.items() if isinstance(a, dict) else [(x.get("url"), x) for x in a if isinstance(x, dict)]
+              for url, v in items:
+                  ps = v.get("params") if isinstance(v, dict) else v
+                  if ps:
+                      f.append({"title": "Versteckte Parameter entdeckt", "description": "Arjun hat Parameter gefunden, die nirgends verlinkt sind, aber vom Server ausgewertet werden.",
+                                "severity": "info", "url": str(url), "evidence": "Seite: %s\nParameter: %s" % (url, ", ".join(map(str, ps)))})
+          except Exception: pass
+          save("arjun", f)
+          # retire.js: Bibliotheken + bekannte Lücken
+          f = []; seen = set()
+          for rec in jl("reports/retirejs-raw.jsonl"):
+              r = rec.get("retire"); uri = rec.get("uri")
+              data = r.get("data") if isinstance(r, dict) else r
+              for fe in data or []:
+                  for res in fe.get("results") or []:
+                      name, ver = res.get("component"), res.get("version")
+                      if (name, ver) in seen: continue
+                      seen.add((name, ver))
+                      f.append(comp(name, ver, "retire.js", uri))
+                      vs = res.get("vulnerabilities") or []
+                      if vs:
+                          order = ["low", "medium", "high", "critical"]
+                          sev = max((str(v.get("severity", "medium")).lower() for v in vs), key=lambda x: order.index(x) if x in order else 1)
+                          cve = sorted({c for v in vs for c in (v.get("identifiers") or {}).get("CVE", [])})
+                          summ = [str((v.get("identifiers") or {}).get("summary") or "") for v in vs]
+                          f.append({"title": "Verwundbare JavaScript-Bibliothek: %s %s" % (name, ver), "description": "%s %s hat %d bekannte Schwachstellen. %s" % (name, ver, len(vs), " | ".join(s for s in summ if s)[:800]),
+                                    "severity": sev if sev in order else "medium", "url": uri, "cve_ids": cve[:20],
+                                    "evidence": "Datei: %s\nBibliothek: %s %s\n\n%s" % (uri, name, ver, "\n".join("- [%s] %s %s" % (v.get("severity"), (v.get("identifiers") or {}).get("summary") or "", ", ".join((v.get("identifiers") or {}).get("CVE", []))) for v in vs[:15]))})
+          save("retirejs", f)
+          # wpscan
+          f = []
+          try:
+              w = json.load(open("reports/wpscan-raw.json", encoding="utf-8", errors="replace"))
+              def vulns(owner, label, url):
+                  for v in owner.get("vulnerabilities") or []:
+                      cves = ["CVE-" + c for c in (v.get("references") or {}).get("cve", [])]
+                      f.append({"title": "%s: %s" % (label, v.get("title")), "description": "Bekannte WordPress-Schwachstelle. Behoben in: %s" % (v.get("fixed_in") or "unbekannt"),
+                                "severity": "high", "url": url, "cve_ids": cves, "evidence": "Komponente: %s\nTitel: %s\nBehoben in: %s\nQuellen: %s" % (label, v.get("title"), v.get("fixed_in"), json.dumps(v.get("references") or {}))})
+              if w.get("version"):
+                  f.append(comp("WordPress", w["version"].get("number"), "WPScan", "https://%s" % T)); vulns(w["version"], "WordPress " + str(w["version"].get("number")), "https://%s" % T)
+              th = w.get("main_theme")
+              if th:
+                  v = (th.get("version") or {}).get("number"); f.append(comp("WordPress-Theme " + str(th.get("slug")), v, "WPScan", th.get("location") or T)); vulns(th, "Theme " + str(th.get("slug")), th.get("location"))
+              for slug, pl in (w.get("plugins") or {}).items():
+                  v = (pl.get("version") or {}).get("number"); f.append(comp("WordPress-Plugin " + slug, v, "WPScan", pl.get("location") or T)); vulns(pl, "Plugin " + slug, pl.get("location"))
+          except Exception: pass
+          save("wpscan", f)
+          # subfinder: Subdomains
+          try:
+              subs = sorted({(d.get("host") or "").strip().lower() for d in jl("reports/subfinder-raw.json") if d.get("host")})
+          except Exception: subs = []
+          if subs:
+              save("subfinder", [{"title": "Entdeckte Subdomains (Subfinder)", "description": "Subfinder hat %d Subdomains von %s in öffentlichen Quellen gefunden. Jede davon ist eine eigene Angriffsfläche." % (len(subs), T),
+                                  "severity": "info", "url": "https://%s" % T, "evidence": "Anzahl: %d\n\n%s" % (len(subs), "\n".join(subs[:300]))}])
+          # naabu: offene Ports
+          f = []
+          for d in jl("reports/naabu-raw.json"):
+              port = d.get("port")
+              if port is None: continue
+              ip = d.get("ip") or d.get("host") or T
+              f.append({"title": "Offener Port %s (Naabu)" % port, "description": "Naabu hat auf %s den TCP-Port %s offen vorgefunden." % (ip, port), "severity": "info",
+                        "url": "%s:%s" % (ip, port), "evidence": "Host: %s\nIP: %s\nPort: %s\nMethode: TCP-Connect" % (d.get("host") or T, ip, port)})
+          save("naabu", f)
+          # sslyze: TLS-Schwächen
+          f = []
+          try:
+              s = json.load(open("reports/sslyze-raw.json", encoding="utf-8", errors="replace"))
+              for sr in s.get("server_scan_results") or []:
+                  res = sr.get("scan_result") or {}
+                  host = "https://%s" % T
+                  def r(key): return ((res.get(key) or {}).get("result") or {})
+                  for key, name, sev in (("ssl_2_0_cipher_suites", "SSL 2.0", "high"), ("ssl_3_0_cipher_suites", "SSL 3.0", "high"), ("tls_1_0_cipher_suites", "TLS 1.0", "medium"), ("tls_1_1_cipher_suites", "TLS 1.1", "medium")):
+                      acc = r(key).get("accepted_cipher_suites") or []
+                      if acc:
+                          names = [((c.get("cipher_suite") or {}).get("name") or "?") for c in acc]
+                          f.append({"title": "Veraltetes Protokoll aktiv: %s (SSLyze)" % name, "description": "Der Server akzeptiert %s mit %d Cipher-Suites. Dieses Protokoll gilt als unsicher." % (name, len(acc)), "severity": sev, "url": host,
+                                    "evidence": "Protokoll: %s\nAkzeptierte Cipher-Suites:\n%s" % (name, "\n".join(names[:30]))})
+                  if r("heartbleed").get("is_vulnerable_to_heartbleed"):
+                      f.append({"title": "Heartbleed-Schwachstelle (SSLyze)", "description": "Der Server ist für Heartbleed (CVE-2014-0160) anfällig.", "severity": "critical", "url": host, "cve_ids": ["CVE-2014-0160"], "evidence": "SSLyze: is_vulnerable_to_heartbleed = true"})
+                  if r("openssl_ccs_injection").get("is_vulnerable_to_ccs_injection"):
+                      f.append({"title": "OpenSSL CCS Injection (SSLyze)", "description": "Der Server ist für CCS Injection (CVE-2014-0224) anfällig.", "severity": "high", "url": host, "cve_ids": ["CVE-2014-0224"], "evidence": "SSLyze: is_vulnerable_to_ccs_injection = true"})
+                  rob = str(r("robot").get("robot_result") or "")
+                  if rob.startswith("VULNERABLE"):
+                      f.append({"title": "ROBOT-Schwachstelle (SSLyze)", "description": "Der Server ist für den ROBOT-Angriff auf RSA-Verschlüsselung anfällig.", "severity": "high", "url": host, "evidence": "SSLyze robot_result: %s" % rob})
+                  if r("tls_compression").get("supports_compression"):
+                      f.append({"title": "TLS-Kompression aktiv (CRIME) (SSLyze)", "description": "TLS-Kompression ermöglicht den CRIME-Angriff.", "severity": "medium", "url": host, "evidence": "SSLyze: supports_compression = true"})
+                  rn = r("session_renegotiation")
+                  if rn.get("is_vulnerable_to_client_renegotiation_dos") or rn.get("supports_secure_renegotiation") is False:
+                      f.append({"title": "Unsichere TLS-Renegotiation (SSLyze)", "description": "Der Server erlaubt unsichere oder DoS-anfällige Renegotiation.", "severity": "medium", "url": host, "evidence": json.dumps(rn)})
+                  for dep in r("certificate_info").get("certificate_deployments") or []:
+                      for pv in dep.get("path_validation_results") or []:
+                          if pv.get("was_validation_successful") is False:
+                              f.append({"title": "Zertifikat nicht vertrauenswürdig (SSLyze)", "description": "Die Zertifikatskette wurde gegen den Truststore '%s' nicht akzeptiert." % ((pv.get("trust_store") or {}).get("name") or "?"),
+                                        "severity": "high", "url": host, "evidence": "Truststore: %s\nFehler: %s" % ((pv.get("trust_store") or {}).get("name"), pv.get("validation_error"))})
+                              break
+          except Exception: pass
+          save("sslyze", f)
+          # whatweb: Technik-Inventar
+          f = []
+          try:
+              raw = open("reports/whatweb-raw.json", encoding="utf-8", errors="replace").read().strip()
+              try: data = json.loads(raw)
+              except ValueError: data = [json.loads(l.strip().rstrip(",")) for l in raw.splitlines() if l.strip().startswith("{")]
+              if isinstance(data, dict): data = [data]
+              for d in data:
+                  where = d.get("target") or "https://%s" % T
+                  for name, info in (d.get("plugins") or {}).items():
+                      if name in ("HTTPServer", "IP", "Country", "Title", "UncommonHeaders", "HTML5", "Email", "Cookies", "HttpOnly", "Strict-Transport-Security", "RedirectLocation", "Meta-Refresh-Redirect", "Script", "X-Frame-Options", "X-XSS-Protection", "X-UA-Compatible", "PasswordField", "Open-Graph-Protocol", "Content-Language", "Via-Proxy", "ETag", "Frame", "Access-Control-Allow-Methods", "X-Powered-By"):
+                          if name == "X-Powered-By":
+                              for v in (info.get("string") or []): f.append(comp("X-Powered-By " + str(v), "", "WhatWeb", where))
+                          continue
+                      vers = info.get("version") or []
+                      f.append(comp(name, str(vers[0]) if vers else "", "WhatWeb", where))
+          except Exception: pass
+          seen = set(); f = [x for x in f if not (x["title"] in seen or seen.add(x["title"]))]
+          save("whatweb", f)
+          # nmap --script vuln
+          f = []
+          try:
+              for host in ET.parse("reports/nmapvuln-raw.xml").getroot().iter("host"):
+                  a = host.find("address"); ip = a.get("addr") if a is not None else T
+                  for port in host.iter("port"):
+                      for sc in port.findall("script"):
+                          out = (sc.get("output") or "").strip()
+                          if not out or "ERROR" in out[:20] or "couldn't find any" in out.lower(): continue
+                          cves = sorted(set(re.findall(r"CVE-\d{4}-\d{4,7}", out)))
+                          scores = [float(x) for x in re.findall(r"CVE-\d{4}-\d{4,7}\s+(\d+\.\d)", out)]
+                          vulnerable = "VULNERABLE" in out and "NOT VULNERABLE" not in out.upper().replace("LIKELY VULNERABLE", "VULNERABLE")
+                          if not (vulnerable or cves): continue
+                          top = max(scores) if scores else 0
+                          sev = "critical" if top >= 9 else "high" if top >= 7 else "medium" if top >= 4 else ("high" if vulnerable else "low")
+                          f.append({"title": "%s auf Port %s (Nmap)" % (sc.get("id"), port.get("portid")), "description": "Nmap-Skript %s meldet auf %s:%s mögliche Schwachstellen (%d CVE-Hinweise)." % (sc.get("id"), ip, port.get("portid"), len(cves)),
+                                    "severity": sev, "url": "%s:%s" % (ip, port.get("portid")), "cve_ids": cves[:20], "evidence": "Skript: %s\nPort: %s/%s\n\n%s" % (sc.get("id"), port.get("portid"), port.get("protocol"), out[:3000])})
+          except Exception: pass
+          save("nmapvuln", f)
           PYEOF
 
       - name: Ingest reports
