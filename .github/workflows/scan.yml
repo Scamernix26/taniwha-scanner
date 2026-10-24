@@ -174,7 +174,8 @@ jobs:
           # OpenVAS (Greenbone) – läuft als dauerhafter Container "openvas"; Feeds werden beim ersten Start geladen (30–60 min)
           if has openvas; then
             OV_PW="${OPENVAS_PASSWORD:-taniwha-openvas-local}"
-            gmp() { docker exec -u gvmd openvas gvm-cli --gmp-username admin --gmp-password "$OV_PW" socket --socketpath /run/gvmd/gvmd.sock --xml "$1"; }
+            OV_USER=$(docker exec openvas sh -c 'id -u gvm >/dev/null 2>&1 && echo gvm || echo gvmd' 2>/dev/null || echo gvm)
+            gmp() { docker exec -u "${OV_USER:-gvm}" openvas gvm-cli --gmp-username admin --gmp-password "$OV_PW" socket --socketpath /run/gvmd/gvmd.sock --xml "$1"; }
             id_of() { grep -o 'id="[^"]*"' | head -1 | cut -d'"' -f2; }
             s=$SECONDS
             ev openvas info "Startet: OpenVAS-Vollscan (Greenbone) auf $TARGET"
@@ -224,7 +225,7 @@ jobs:
           [ -n "$ids" ] && docker rm -f $ids || true
           # OpenVAS-Task bei Abbruch stoppen (der Container selbst bleibt bestehen)
           if [ -s reports/openvas-task-id ]; then
-            docker exec -u gvmd openvas gvm-cli --gmp-username admin --gmp-password "${OPENVAS_PASSWORD:-taniwha-openvas-local}" socket --socketpath /run/gvmd/gvmd.sock --xml "<stop_task task_id='$(cat reports/openvas-task-id)'/>" >/dev/null 2>&1 || true
+            docker exec -u "${OV_USER:-gvm}" openvas gvm-cli --gmp-username admin --gmp-password "${OPENVAS_PASSWORD:-taniwha-openvas-local}" socket --socketpath /run/gvmd/gvmd.sock --xml "<stop_task task_id='$(cat reports/openvas-task-id)'/>" >/dev/null 2>&1 || true
           fi
 
       - name: Convert nmap/sqlmap reports to JSON
