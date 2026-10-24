@@ -1,0 +1,66 @@
+# Place at .github/workflows/scan.yml in the <org>/security-runner repository.
+# Repository secrets: PLATFORM_INGEST_URL (…/api/public/ingest-results), RUNNER_INGEST_SECRET
+name: Security Scan
+on:
+  workflow_dispatch:
+    inputs:
+      scan_id: { required: true }
+      target_domain: { required: true }
+      tools: { required: true } # comma separated: zap,nuclei,testssl,...
+      callback_url: { required: false }
+
+jobs:
+  scan:
+    runs-on: self-hosted
+    env:
+      INGEST_URL: ${{ inputs.callback_url || secrets.PLATFORM_INGEST_URL }}
+      INGEST_SECRET: ${{ secrets.RUNNER_INGEST_SECRET }}
+      SCAN_ID: ${{ inputs.scan_id }}
+      TARGET: ${{ inputs.target_domain }}
+      TOOLS: ${{ inputs.tools }}
+    steps:
+      - name: Validate inputs (no shell injection)
+        run: |
+          [[ "$TARGET" =~ ^[a-zA-Z0-9.-]+$ ]] || { echo "invalid target"; exit 1; }
+          [[ "$SCAN_ID" =~ ^[0-9a-f-]{36}$ ]] || { echo "invalid scan id"; exit 1; }
+          [[ "$TOOLS" =~ ^[a-z,]+$ ]] || { echo "invalid tools"; exit 1; }
+
+      - name: Status running
+        run: |
+          curl -fsS -X POST "$INGEST_URL" -H "Authorization: Bearer $INGEST_SECRET" -H "Content-Type: application/json" \
+            -d "{\"scan_id\":\"$SCAN_ID\",\"status\":\"running\"}"
+
+      - name: Run tools
+        run: |
+          mkdir -p reports
+          has() { [[ ",$TOOLS," == *",$1,"* ]]; }
+          has zap && docker run --rm -v "$PWD/reports:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable zap-full-scan.py -t "https://$TARGET" -J zap-report.json -m 10 || true
+          has nuclei && docker run --rm -v "$PWD/reports:/reports" projectdiscovery/nuclei:latest -u "https://$TARGET" -severity critical,high,medium -jsonl-export /reports/nuclei-report.json -rate-limit 50 || true
+          has nikto && docker run --rm -v "$PWD/reports:/reports" frapsoft/nikto -h "https://$TARGET" -Format json -output /reports/nikto-report.json || true
+          has testssl && docker run --rm -v "$PWD/reports:/reports" drwetter/testssl.sh:latest --jsonfile /reports/testssl-report.json "$TARGET" || true
+          has trivy && docker run --rm -v "$PWD:/repo" -v "$PWD/reports:/reports" aquasec/trivy:latest fs --format json --output /reports/trivy-report.json /repo || true
+          has semgrep && docker run --rm -v "$PWD:/src" -v "$PWD/reports:/reports" returntocorp/semgrep:latest semgrep scan --config auto --json --output /reports/semgrep-report.json /src || true
+          has gitleaks && docker run --rm -v "$PWD:/repo" -v "$PWD/reports:/reports" zricethezav/gitleaks:latest detect --source /repo --report-format json --report-path /reports/gitleaks-report.json || true
+          has depcheck && docker run --rm -v "$PWD:/src" -v "$PWD/reports:/reports" owasp/dependency-check:latest --project App --scan /src --format JSON --out /reports || true
+          [ -f reports/dependency-check-report.json ] && mv reports/dependency-check-report.json reports/depcheck-report.json || true
+
+      - name: Ingest reports
+        run: |
+          for f in reports/*-report.json; do
+            [ -f "$f" ] || continue
+            tool=$(basename "$f" -report.json)
+            jq -cs --arg scan_id "$SCAN_ID" --arg tool "$tool" '{scan_id:$scan_id,tool:$tool,raw:.}' "$f" > payload.json || continue
+            curl -fsS -X POST "$INGEST_URL" -H "Authorization: Bearer $INGEST_SECRET" -H "Content-Type: application/json" --data-binary @payload.json || true
+          done
+
+      - name: Status done
+        if: success()
+        run: |
+          curl -fsS -X POST "$INGEST_URL" -H "Authorization: Bearer $INGEST_SECRET" -H "Content-Type: application/json" \
+            -d "{\"scan_id\":\"$SCAN_ID\",\"status\":\"done\"}"
+
+      - name: Status failed
+        if: failure()
+        run: |
+          curl -fsS -X POST "$INGEST_URL" -H "Authorization: Bearer $INGEST_SECRET" -H "Content-Type: application/json" \
+            -d "{\"scan_id\":\"$SCAN_ID\",\"status\":\"failed\"}"
