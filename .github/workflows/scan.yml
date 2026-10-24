@@ -37,22 +37,39 @@ jobs:
         run: |
           has() { [[ ",$TOOLS," == *",$1,"* ]]; }
           ev() { # ev <tool> <level> <message>  – live progress for the Taniwha UI
-            jq -nc --arg s "$SCAN_ID" --arg t "$1" --arg l "$2" --arg m "$3" '{scan_id:$s,tool:$t,level:$l,event:$m}' \
+            python3 -c 'import json,sys;print(json.dumps({"scan_id":sys.argv[1],"tool":sys.argv[2],"level":sys.argv[3],"event":sys.argv[4][:500]}))' "$SCAN_ID" "$1" "$2" "$3" \
               | curl -sS -X POST "$INGEST_URL" -H "Authorization: Bearer $INGEST_SECRET" -H "Content-Type: application/json" --data-binary @- >/dev/null || true
           }
           run() { # run <tool> <description> <docker args...>  – containers are named so a cancel can stop them
             local t="$1" d="$2"; shift 2
             has "$t" || return 0
             ev "$t" info "Startet: $d"
-            local s=$SECONDS
-            if docker run --rm --name "taniwha-$SCAN_ID-$t" "$@"; then ev "$t" ok "Fertig nach $((SECONDS-s)) s"; else ev "$t" warn "Beendet mit Fehlercode nach $((SECONDS-s)) s"; fi
+            mkdir -p reports/logs
+            local s=$SECONDS rc=0
+            echo "\$ docker run --rm --name taniwha-$SCAN_ID-$t $*" > "reports/logs/$t.log"
+            docker run --rm --name "taniwha-$SCAN_ID-$t" "$@" >> "reports/logs/$t.log" 2>&1 || rc=$?
+            local dur=$((SECONDS-s))
+            if [ $rc -eq 0 ]; then ev "$t" ok "Fertig nach $dur s"; else ev "$t" warn "Beendet mit Fehlercode $rc nach $dur s"; fi
+            runlog "$t" "docker run $*" "$rc" "$dur"
+          }
+          runlog() { # runlog <tool> <command> <exit> <seconds>  – full server log for the Taniwha UI
+            python3 - "$SCAN_ID" "$1" "$2" "$3" "$4" "reports/logs/$1.log" <<'PY' \
+              | curl -sS -X POST "$INGEST_URL" -H "Authorization: Bearer $INGEST_SECRET" -H "Content-Type: application/json" --data-binary @- >/dev/null || true
+          import json, re, sys
+          sid, tool, cmd, rc, dur, path = sys.argv[1:7]
+          try: log = open(path, encoding="utf-8", errors="replace").read()
+          except OSError: log = ""
+          log = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", log)
+          if len(log) > 190000: log = log[:40000] + "\n\n… (gekürzt) …\n\n" + log[-150000:]
+          print(json.dumps({"scan_id": sid, "tool": tool, "run": {"command": cmd[:4000], "exit_code": int(rc), "duration_s": int(dur), "log": log}}))
+          PY
           }
           ev "" info "Scan-Rechner $(hostname) startet – Ziel $TARGET"
           # Wortliste für ffuf vorbereiten (einmalig pro Lauf)
           WLIST="$PWD/reports/seclists-common.txt"
           [ -s "$WLIST" ] || curl -fsSL -o "$WLIST" "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" || true
           run zap "ZAP Full-Scan (Spider + aktive Angriffe, max. 10 min Spider) auf https://$TARGET" -v "$PWD/reports:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable zap-full-scan.py -t "https://$TARGET" -J zap-report.json -m 10
-          run nuclei "Nuclei-Templates (critical/high/medium, 50 Req/s) gegen https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/nuclei:latest -u "https://$TARGET" -severity critical,high,medium -jsonl-export /reports/nuclei-report.json -rate-limit 50
+          run nuclei "Nuclei-Templates (critical/high/medium, 50 Req/s) gegen https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/nuclei:latest -u "https://$TARGET" -severity critical,high,medium -jsonl-export /reports/nuclei-report.json -rate-limit 50 -stats -si 30
           run nikto "Nikto Webserver-Prüfung auf https://$TARGET" -v "$PWD/reports:/reports" frapsoft/nikto -h "https://$TARGET" -Format json -output /reports/nikto-report.json
           run testssl "TLS/SSL-Konfiguration von $TARGET" -v "$PWD/reports:/reports" drwetter/testssl.sh:latest --jsonfile /reports/testssl-report.json "$TARGET"
           run ffuf "ffuf Verzeichnis-Entdeckung (SecLists common.txt) auf https://$TARGET" -v "$PWD/reports:/reports" trickest/ffuf -u "https://$TARGET/FUZZ" -w /reports/seclists-common.txt -ac -t 20 -timeout 10 -of json -o /reports/ffuf-report.json
@@ -209,7 +226,16 @@ jobs:
           for f in reports/*-report.json; do
             [ -s "$f" ] || continue
             tool=$(basename "$f" -report.json)
-            jq -cs --arg scan_id "$SCAN_ID" --arg tool "$tool" '{scan_id:$scan_id,tool:$tool,raw:.}' "$f" > payload.json 2>/dev/null || continue
+            python3 - "$SCAN_ID" "$tool" "$f" > payload.json <<'PY' || continue
+          import json, sys
+          txt = open(sys.argv[3], encoding="utf-8", errors="replace").read()
+          dec, i, vals = json.JSONDecoder(), 0, []
+          while True:
+              while i < len(txt) and txt[i].isspace(): i += 1
+              if i >= len(txt): break
+              v, i = dec.raw_decode(txt, i); vals.append(v)
+          print(json.dumps({"scan_id": sys.argv[1], "tool": sys.argv[2], "raw": vals}))
+          PY
             curl -fsS -X POST "$INGEST_URL" -H "Authorization: Bearer $INGEST_SECRET" -H "Content-Type: application/json" --data-binary @payload.json || true
           done
 
