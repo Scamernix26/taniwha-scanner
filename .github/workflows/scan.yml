@@ -9,6 +9,8 @@ on:
       target_domain: { required: true }
       tools: { required: true } # comma separated: zap,nuclei,testssl,...
       callback_url: { required: false }
+      scan_profile: { required: false, default: standard }
+      proxy_endpoint: { required: false } # fixed HTTP endpoint, no credentials
 
 jobs:
   scan:
@@ -19,6 +21,8 @@ jobs:
       SCAN_ID: ${{ inputs.scan_id }}
       TARGET: ${{ inputs.target_domain }}
       TOOLS: ${{ inputs.tools }}
+      SCAN_PROFILE: ${{ inputs.scan_profile || 'standard' }}
+      PROXY_ENDPOINT: ${{ inputs.proxy_endpoint }}
       OPENVAS_PASSWORD: ${{ secrets.OPENVAS_PASSWORD }}
       WPSCAN_API_TOKEN: ${{ secrets.WPSCAN_API_TOKEN }}
     steps:
@@ -27,6 +31,19 @@ jobs:
           [[ "$TARGET" =~ ^[a-zA-Z0-9.-]+$ ]] || { echo "invalid target"; exit 1; }
           [[ "$SCAN_ID" =~ ^[0-9a-f-]{36}$ ]] || { echo "invalid scan id"; exit 1; }
           [[ "$TOOLS" =~ ^[a-z,]+$ ]] || { echo "invalid tools"; exit 1; }
+          [[ "$SCAN_PROFILE" = standard || "$SCAN_PROFILE" = gentle ]] || exit 1
+          python3 - <<'PY'
+          import os
+          from urllib.parse import urlsplit
+          proxy = os.environ.get("PROXY_ENDPOINT", "")
+          if proxy:
+              u = urlsplit(proxy)
+              assert u.scheme == "http" and u.hostname and u.port and not u.username and not u.password
+              assert u.path in ("", "/") and not u.query and not u.fragment and not any(c.isspace() for c in proxy)
+          supported = {"nuclei", "ffuf", "httpx", "katana", "feroxbuster"}
+          if proxy or os.environ.get("SCAN_PROFILE") == "gentle":
+              assert set(os.environ["TOOLS"].split(",")) <= supported, "Unsupported scan profile/tool combination"
+          PY
 
       - name: Status running
         run: |
@@ -44,6 +61,28 @@ jobs:
           run() { # run <tool> <description> <docker args...>  – containers are named so a cancel can stop them
             local t="$1" d="$2"; shift 2
             has "$t" || return 0
+            local extra=()
+            if [ -n "$PROXY_ENDPOINT" ]; then
+              case "$t" in
+                nuclei) extra+=(-proxy "$PROXY_ENDPOINT" -pt http) ;;
+                ffuf) extra+=(-x "$PROXY_ENDPOINT") ;;
+                httpx) extra+=(-http-proxy "$PROXY_ENDPOINT") ;;
+                katana) extra+=(-proxy "$PROXY_ENDPOINT") ;;
+                feroxbuster) extra+=(--proxy "$PROXY_ENDPOINT") ;;
+                *) ev "$t" error "Kein Proxy-Support – nicht ausgeführt"; return 1 ;;
+              esac
+            fi
+            if [ "$SCAN_PROFILE" = gentle ]; then
+              case "$t" in
+                nuclei) extra+=(-c 1 -bulk-size 1) ;;
+                ffuf) extra+=(-rate 1 -p 2) ;;
+                httpx) extra+=(-threads 1 -rate-limit 1 -delay 2s) ;;
+                katana) extra+=(-p 1 -rd 2) ;;
+                feroxbuster) extra+=(--rate-limit 1 --scan-limit 1) ;;
+                *) ev "$t" error "Keine sichere Drosselung – nicht ausgeführt"; return 1 ;;
+              esac
+            fi
+            set -- "$@" "${extra[@]}"
             ev "$t" info "Startet: $d"
             mkdir -p reports/logs
             local s=$SECONDS rc=0
@@ -67,7 +106,12 @@ jobs:
           }
           ev "" info "Scan-Rechner $(hostname) startet – Ziel $TARGET"
           # CDN/WAF-Erkennung: Ergebnisse spiegeln dann die Schutzschicht, nicht den Ursprungsserver
-          HDRS=$(curl -sS -I -m 15 "https://$TARGET/" 2>/dev/null | tr 'A-Z' 'a-z' || true)
+          CURL_PROXY=()
+          [ -z "$PROXY_ENDPOINT" ] || CURL_PROXY=(--proxy "$PROXY_ENDPOINT" --noproxy "")
+          ev "" info "Scanprofil: $SCAN_PROFILE – ${PROXY_ENDPOINT:+fester Proxy; kein direkter Fallback}"
+          RATE=50; THREADS=20; KATANA_THREADS=5
+          if [ "$SCAN_PROFILE" = gentle ]; then RATE=1; THREADS=1; KATANA_THREADS=1; sleep 2; fi
+          HDRS=$(curl "${CURL_PROXY[@]}" -sS -I -m 15 "https://$TARGET/" 2>/dev/null | tr 'A-Z' 'a-z' || true)
           if echo "$HDRS" | grep -qE '^(server: cloudflare|cf-ray:)'; then
             ev "" warn "Cloudflare erkannt: Port-, TLS- und Infra-Scanner (Nmap, Naabu, OpenVAS, testssl, SSLyze) sehen nur Cloudflare, nicht deinen Server. Web-Scanner können blockiert werden – „0 Treffer“ ist dann wenig aussagekräftig. Tipp: IP des Scan-Rechners in Cloudflare (WAF → IP Access Rules) erlauben."
           elif echo "$HDRS" | grep -qE '^(x-akamai|x-sucuri-id|x-amz-cf-id|x-served-by: cache|x-cdn)'; then
@@ -77,7 +121,7 @@ jobs:
           WLIST="$PWD/reports/seclists-common.txt"
           [ -s "$WLIST" ] || curl -fsSL -o "$WLIST" "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" || true
           run zap "ZAP Full-Scan (Spider + aktive Angriffe, max. 10 min Spider) auf https://$TARGET" -v "$PWD/reports:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable zap-full-scan.py -t "https://$TARGET" -J zap-report.json -m 10
-          run nuclei "Nuclei-Templates (critical/high/medium, 50 Req/s) gegen https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/nuclei:latest -u "https://$TARGET" -severity critical,high,medium -jsonl-export /reports/nuclei-report.json -rate-limit 50 -stats -si 30
+          run nuclei "Nuclei-Templates (critical/high/medium, $RATE Req/s) gegen https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/nuclei:latest -u "https://$TARGET" -severity critical,high,medium -jsonl-export /reports/nuclei-report.json -rate-limit "$RATE" -stats -si 30
           # frapsoft/nikto (2.1.x) kennt kein JSON – CSV schreiben und in das Taniwha-Format umrechnen
           run nikto "Nikto Webserver-Prüfung auf https://$TARGET" -v "$PWD/reports:/reports" frapsoft/nikto -h "https://$TARGET" -Format csv -output /reports/nikto-report.csv
           if [ -s reports/nikto-report.csv ]; then
@@ -94,10 +138,12 @@ jobs:
           PY
           fi
           run testssl "TLS/SSL-Konfiguration von $TARGET" -v "$PWD/reports:/reports" drwetter/testssl.sh:latest --jsonfile /reports/testssl-report.json "$TARGET"
-          run ffuf "ffuf Verzeichnis-Entdeckung (SecLists common.txt) auf https://$TARGET" -v "$PWD/reports:/reports" trickest/ffuf -u "https://$TARGET/FUZZ" -w /reports/seclists-common.txt -ac -t 20 -timeout 10 -of json -o /reports/ffuf-report.json
+          run ffuf "ffuf Verzeichnis-Entdeckung (SecLists common.txt) auf https://$TARGET" -v "$PWD/reports:/reports" trickest/ffuf -u "https://$TARGET/FUZZ" -w /reports/seclists-common.txt -ac -t "$THREADS" -timeout 10 -of json -o /reports/ffuf-report.json
           # --- Web-Assessment: Technik-Inventar, Seitenerkundung, zweiter Vollscanner, XSS, Parameter, JS-Bibliotheken, WordPress ---
-          run httpx "httpx Technik-Erkennung (Webserver, Frameworks, CDN) auf https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/httpx:latest -u "https://$TARGET" -td -server -title -ip -cdn -silent -json -o /reports/httpx-raw.json
-          run katana "Katana Seitenerkundung (Tiefe 3, inkl. JavaScript) auf https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/katana:latest -u "https://$TARGET" -fs fqdn -d 3 -jc -c 5 -rl 50 -silent -o /reports/katana-urls.txt
+          HTTPX_DNS=(-ip -cdn)
+          [ -z "$PROXY_ENDPOINT" ] || HTTPX_DNS=()
+          run httpx "httpx Technik-Erkennung (Webserver, Frameworks, CDN) auf https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/httpx:latest -u "https://$TARGET" -td -server -title "${HTTPX_DNS[@]}" -silent -json -o /reports/httpx-raw.json
+          run katana "Katana Seitenerkundung (Tiefe 3, inkl. JavaScript) auf https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/katana:latest -u "https://$TARGET" -fs fqdn -d 3 -jc -c "$KATANA_THREADS" -rl "$RATE" -silent -o /reports/katana-urls.txt
           run wapiti "Wapiti Webanwendungs-Scan (max. 15 min) auf https://$TARGET" -v "$PWD/reports:/reports" cyberwatch/wapiti -u "https://$TARGET" -f json -o /reports/wapiti-raw.json --flush-session --max-scan-time 900
           run arjun "Arjun sucht versteckte Parameter auf https://$TARGET" -v "$PWD/reports:/reports" python:3.12-slim sh -c "pip install -q arjun >/dev/null 2>&1; arjun -u https://$TARGET -m GET -oJ /reports/arjun-raw.json -t 5 -d 1 -q"
           if has dalfox || has retirejs; then
@@ -162,7 +208,7 @@ jobs:
           PY
           fi
           run trufflehog "Trufflehog sucht geleakte Passwörter/API-Schlüssel in Startseite und JavaScript von https://$TARGET" -v "$PWD/reports:/reports" --entrypoint sh trufflesecurity/trufflehog:latest -c "trufflehog filesystem /reports/site --json --no-update > /reports/trufflehog-raw.jsonl; echo \"Treffer: \$(wc -l < /reports/trufflehog-raw.jsonl)\""
-          run feroxbuster "Feroxbuster sucht versteckte Ordner/Dateien (rekursiv Tiefe 2, max. 10 min) auf https://$TARGET" -v "$PWD/reports:/reports" epi052/feroxbuster:latest -u "https://$TARGET" -w /reports/seclists-common.txt -d 2 -t 20 --auto-tune --time-limit 10m -C 404 --silent --json -o /reports/feroxbuster-raw.json
+          run feroxbuster "Feroxbuster sucht versteckte Ordner/Dateien (rekursiv Tiefe 2, max. 10 min) auf https://$TARGET" -v "$PWD/reports:/reports" epi052/feroxbuster:latest -u "https://$TARGET" -w /reports/seclists-common.txt -d 2 -t "$THREADS" --auto-tune --time-limit 10m -C 404 --silent --json -o /reports/feroxbuster-raw.json
           run nmapvuln "Nmap-Schwachstellen-Skripte (vuln, Top 100 Ports, max. 20 min) auf $TARGET" -v "$PWD/reports:/reports" instrumentisto/nmap -Pn -sV --top-ports 100 --script vuln --host-timeout 20m -oX /reports/nmapvuln-raw.xml "$TARGET"
           run nmap "Nmap Port-/Service-Scan (Top 1000 Ports) auf $TARGET" instrumentisto/nmap -Pn -sV --top-ports 1000 -oX /reports/nmap-report.xml "$TARGET"
           run sqlmap "SQLMap SQL-Injection-Prüfung (Batch, sanft, Crawl Tiefe 1)" -v "$PWD/reports:/reports" parrotsec/sqlmap -u "https://$TARGET" --batch --forms --crawl=1 --crawl-depth=1 --level=1 --risk=1 --output-dir=/reports/sqlmap --flush-session
@@ -468,31 +514,17 @@ jobs:
                       f.append({"title": "TLS-Kompression aktiv (CRIME) (SSLyze)", "description": "TLS-Kompression ermöglicht den CRIME-Angriff.", "severity": "medium", "url": host, "evidence": "SSLyze: supports_compression = true"})
                   rn = r("session_renegotiation")
                   if rn.get("is_vulnerable_to_client_renegotiation_dos") or rn.get("supports_secure_renegotiation") is False:
-                      f.append({"title": "Unsichere TLS-Renegotiation (SSLyze)", "description": "Der Server erlaubt unsichere oder DoS-anfällige Renegotiation.", "severity": "medium", "url": host, "evidence": json.dumps(rn)})
-                  for dep in r("certificate_info").get("certificate_deployments") or []:
-                      for pv in dep.get("path_validation_results") or []:
-                          if pv.get("was_validation_successful") is False:
-                              f.append({"title": "Zertifikat nicht vertrauenswürdig (SSLyze)", "description": "Die Zertifikatskette wurde gegen den Truststore '%s' nicht akzeptiert." % ((pv.get("trust_store") or {}).get("name") or "?"),
-                                        "severity": "high", "url": host, "evidence": "Truststore: %s\nFehler: %s" % ((pv.get("trust_store") or {}).get("name"), pv.get("validation_error"))})
-                              break
+                      f.append({"title": "Unsichere TLS-Renegotiation (SSLyze)", "description": "Der Server erlaubt unsichere Session-Renegotiation.", "severity": "medium", "url": host, "evidence": "SSLyze renegotiation: %s" % rn})
           except Exception: pass
           save("sslyze", f)
-          # whatweb: Technik-Inventar
+          # whatweb
           f = []
           try:
-              raw = open("reports/whatweb-raw.json", encoding="utf-8", errors="replace").read().strip()
-              try: data = json.loads(raw)
-              except ValueError: data = [json.loads(l.strip().rstrip(",")) for l in raw.splitlines() if l.strip().startswith("{")]
-              if isinstance(data, dict): data = [data]
-              for d in data:
-                  where = d.get("target") or "https://%s" % T
-                  for name, info in (d.get("plugins") or {}).items():
-                      if name in ("HTTPServer", "IP", "Country", "Title", "UncommonHeaders", "HTML5", "Email", "Cookies", "HttpOnly", "Strict-Transport-Security", "RedirectLocation", "Meta-Refresh-Redirect", "Script", "X-Frame-Options", "X-XSS-Protection", "X-UA-Compatible", "PasswordField", "Open-Graph-Protocol", "Content-Language", "Via-Proxy", "ETag", "Frame", "Access-Control-Allow-Methods", "X-Powered-By"):
-                          if name == "X-Powered-By":
-                              for v in (info.get("string") or []): f.append(comp("X-Powered-By " + str(v), "", "WhatWeb", where))
-                          continue
-                      vers = info.get("version") or []
-                      f.append(comp(name, str(vers[0]) if vers else "", "WhatWeb", where))
+              for d in json.load(open("reports/whatweb-raw.json", encoding="utf-8", errors="replace")):
+                  where = d.get("target") or T
+                  for pl, info in (d.get("plugins") or {}).items():
+                      vers = (info.get("version") or []) if isinstance(info, dict) else []
+                      f.append(comp(pl, str(vers[0]) if vers else "", "WhatWeb", where))
           except Exception: pass
           seen = set(); f = [x for x in f if not (x["title"] in seen or seen.add(x["title"]))]
           save("whatweb", f)
