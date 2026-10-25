@@ -1,0 +1,70 @@
+# Place at .github/workflows/maester.yml in the scanner repository (same self-hosted runner as scan.yml).
+# Runs the COMPLETE Maester suite (Maester, EIDSCA, CISA/ScubaGear, CIS tests) in a PowerShell container, read-only.
+# Only repository secret needed: RUNNER_INGEST_SECRET. App ID, tenant and certificate are entered in the Taniwha UI
+# and picked up exactly once from Taniwha (deleted on pickup, never written to GitHub).
+name: Maester
+run-name: Maester ${{ inputs.scan_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      scan_id: { required: true }
+      callback_url: { required: true }
+
+concurrency: { group: maester, cancel-in-progress: false }
+
+jobs:
+  maester:
+    runs-on: self-hosted
+    timeout-minutes: 120
+    env:
+      SCAN_ID: ${{ inputs.scan_id }}
+      CALLBACK: ${{ inputs.callback_url }}
+      INGEST: ${{ secrets.RUNNER_INGEST_SECRET }}
+    steps:
+      - name: Run Maester (PowerShell container)
+        run: |
+          set -euo pipefail
+          [[ "$SCAN_ID" =~ ^[0-9a-f-]{36}$ ]] || { echo "bad scan id"; exit 1; }
+          [[ "$CALLBACK" =~ ^https://[a-z0-9.-]+/api/public/m365-maester$ ]] || { echo "bad callback"; exit 1; }
+          post() { curl -sS -m 30 -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" -d "$1" >/dev/null || true; }
+          WORK=$(mktemp -d); chmod 700 "$WORK"; trap 'rm -rf "$WORK"' EXIT
+          # One-time pickup of app ID, tenant and certificate from Taniwha.
+          curl -sS -m 30 --fail -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" \
+            -d "{\"scan_id\":\"$SCAN_ID\",\"action\":\"pickup\"}" -o "$WORK/creds.json" \
+            || { post "$(jq -nc --arg s "$SCAN_ID" '{scan_id:$s,status:"failed",note:"Zugangsdaten nicht abholbar (abgelaufen oder bereits abgeholt) – bitte in Taniwha neu starten."}')"; exit 1; }
+          export CLIENT_ID=$(jq -r .client_id "$WORK/creds.json") TENANT_ID=$(jq -r .tenant_id "$WORK/creds.json") TENANT_DOMAIN=$(jq -r .tenant_domain "$WORK/creds.json") CERT_PW=$(jq -r .cert_pw "$WORK/creds.json")
+          [ -n "$CERT_PW" ] && echo "::add-mask::$CERT_PW"
+          jq -r .cert_b64 "$WORK/creds.json" | base64 -d > "$WORK/app.pfx"; chmod 600 "$WORK/app.pfx"; rm -f "$WORK/creds.json"
+          [[ "$TENANT_ID" =~ ^[0-9a-fA-F-]{36}$ && "$TENANT_DOMAIN" =~ ^[a-z0-9-]+\.onmicrosoft\.com$ ]] || { post "$(jq -nc --arg s "$SCAN_ID" '{scan_id:$s,status:"failed",note:"Ungültige Tenant-Angaben."}')"; exit 1; }
+          post "$(jq -nc --arg s "$SCAN_ID" '{scan_id:$s,status:"running",note:"Maester läuft auf dem Scan-Rechner"}')"
+          cat > "$WORK/run.ps1" <<'PS'
+          $ErrorActionPreference = 'Stop'
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          foreach ($m in 'Pester','Maester','Microsoft.Graph.Authentication','ExchangeOnlineManagement','MicrosoftTeams','Az.Accounts') {
+            Install-Module $m -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck | Out-Null
+          }
+          Import-Module Pester, Maester
+          $pw = if ($env:CERT_PW) { ConvertTo-SecureString $env:CERT_PW -AsPlainText -Force } else { New-Object System.Security.SecureString }
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('/w/app.pfx', $pw, 'Exportable')
+          Connect-MgGraph -ClientId $env:CLIENT_ID -TenantId $env:TENANT_ID -Certificate $cert -NoWelcome
+          try { Connect-ExchangeOnline -AppId $env:CLIENT_ID -Certificate $cert -Organization $env:TENANT_DOMAIN -ShowBanner:$false } catch { Write-Warning "Exchange Online: $($_.Exception.Message)" }
+          try { Connect-IPPSSession -AppId $env:CLIENT_ID -Certificate $cert -Organization $env:TENANT_DOMAIN -ShowBanner:$false } catch { Write-Warning "Security & Compliance: $($_.Exception.Message)" }
+          try { Connect-MicrosoftTeams -ApplicationId $env:CLIENT_ID -Certificate $cert -TenantId $env:TENANT_ID | Out-Null } catch { Write-Warning "Teams: $($_.Exception.Message)" }
+          try { Connect-AzAccount -ServicePrincipal -ApplicationId $env:CLIENT_ID -CertificatePath '/w/app.pfx' -CertificatePassword $pw -Tenant $env:TENANT_ID | Out-Null } catch { Write-Warning "Azure: $($_.Exception.Message)" }
+          New-Item -ItemType Directory /w/tests -Force | Out-Null
+          Set-Location /w/tests
+          Install-MaesterTests -Path /w/tests
+          Invoke-Maester -Path /w/tests -OutputJsonFile /w/results.json -NonInteractive -SkipGraphConnect -DisableTelemetry | Out-Null
+          PS
+          docker run --rm --name "taniwha-maester-$SCAN_ID" -v "$WORK:/w" \
+            -e CLIENT_ID -e TENANT_ID -e TENANT_DOMAIN -e CERT_PW \
+            mcr.microsoft.com/powershell:lts-ubuntu-22.04 pwsh -NoProfile -File /w/run.ps1 2>&1 | tail -n 400 | tee "$RUNNER_TEMP/maester.log" || true
+          if [ ! -s "$WORK/results.json" ]; then
+            NOTE=$(tail -c 1500 "$RUNNER_TEMP/maester.log" | grep -viE 'secret|password|token' || true)
+            curl -sS -m 30 -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" \
+              -d "$(jq -nc --arg s "$SCAN_ID" --arg n "Maester lieferte kein Ergebnis. $NOTE" '{scan_id:$s,status:"failed",note:$n}')"
+            exit 1
+          fi
+          # Slim the result (drop large HTML/markdown blobs) and send it.
+          jq -c --arg s "$SCAN_ID" '{scan_id:$s,status:"done",results:{TenantId,ExecutedAt,CurrentVersion,Tests:[.Tests[]|{Name,Result,Tag,ErrorRecord:((.ErrorRecord//[])|map(tostring|.[0:500])),ResultDetail:{TestTitle:.ResultDetail.TestTitle,TestDescription:((.ResultDetail.TestDescription//"")|tostring|.[0:1200]),TestResult:((.ResultDetail.TestResult//"")|tostring|.[0:1200]),Severity:.ResultDetail.Severity,SkippedReason:((.ResultDetail.TestSkipped//.ResultDetail.SkippedReason//"")|tostring|.[0:300])}}]}}' "$WORK/results.json" > "$WORK/payload.json"
+          curl -sS -m 120 --fail -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" --data-binary "@$WORK/payload.json"
