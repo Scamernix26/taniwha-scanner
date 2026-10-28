@@ -39,18 +39,29 @@ jobs:
           post "$(jq -nc --arg s "$SCAN_ID" '{scan_id:$s,status:"running",note:"Maester läuft auf dem Scan-Rechner"}')"
           cat > "$WORK/run.ps1" <<'PS'
           $ErrorActionPreference = 'Stop'
+          $warn = New-Object System.Collections.Generic.List[string]
+          function Add-Warn($svc, $msg) { $t = "${svc}: " + ($msg -replace '\s+', ' '); $warn.Add($t.Substring(0, [Math]::Min(300, $t.Length))) | Out-Null; Write-Warning $t }
           Set-PSRepository PSGallery -InstallationPolicy Trusted
           foreach ($m in 'Pester','Maester','Microsoft.Graph.Authentication','ExchangeOnlineManagement','MicrosoftTeams','Az.Accounts') {
             Install-Module $m -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck | Out-Null
           }
+          # SharePoint tests use PnP.PowerShell (Get-PnPTenant). Optional: a failed install only skips the SharePoint tests.
+          try { Install-Module PnP.PowerShell -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck | Out-Null } catch { Add-Warn 'PnP.PowerShell' $_.Exception.Message }
           Import-Module Pester, Maester
           $pw = if ($env:CERT_PW) { ConvertTo-SecureString $env:CERT_PW -AsPlainText -Force } else { New-Object System.Security.SecureString }
-          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('/w/app.pfx', $pw, 'Exportable')
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certicate2('/w/app.pfx', $pw, 'Exportable')
           Connect-MgGraph -ClientId $env:CLIENT_ID -TenantId $env:TENANT_ID -Certificate $cert -NoWelcome
-          try { Connect-ExchangeOnline -AppId $env:CLIENT_ID -Certificate $cert -Organization $env:TENANT_DOMAIN -ShowBanner:$false } catch { Write-Warning "Exchange Online: $($_.Exception.Message)" }
-          try { Connect-IPPSSession -AppId $env:CLIENT_ID -Certificate $cert -Organization $env:TENANT_DOMAIN -ShowBanner:$false } catch { Write-Warning "Security & Compliance: $($_.Exception.Message)" }
-          try { Connect-MicrosoftTeams -ApplicationId $env:CLIENT_ID -Certificate $cert -TenantId $env:TENANT_ID | Out-Null } catch { Write-Warning "Teams: $($_.Exception.Message)" }
-          try { Connect-AzAccount -ServicePrincipal -ApplicationId $env:CLIENT_ID -CertificatePath '/w/app.pfx' -CertificatePassword $pw -Tenant $env:TENANT_ID | Out-Null } catch { Write-Warning "Azure: $($_.Exception.Message)" }
+          try { Connect-ExchangeOnline -AppId $env:CLIENT_ID -Certificate $cert -Organization $env:TENANT_DOMAIN -ShowBanner:$false } catch { Add-Warn 'Exchange Online' $_.Exception.Message }
+          try { Connect-IPPSession -AppId $env:CLIENT_ID -Certificate $cert -Organization $env:TENANT_DOMAIN -ShowBanner:$false } catch { Add-Warn 'Security & Compliance' $_.Exception.Message }
+          try { Connect-MicrosoftTeams -ApplicationId $env:CLIENT_ID -Certificate $cert -TenantId $env:TENANT_ID | Out-Null } catch { Add-Warn 'Teams' $_.Exception.Message }
+          try { Connect-AzAccount -ServicePrincipal -ApplicationId $env:CLIENT_ID -CertificatePath '/w/app.pfx' -CertificatePassword $pw -Tenant $env:TENANT_ID | Out-Null } catch { Add-Warn 'Azure' $_.Exception.Message }
+          # SharePoint admin site, app-only with the same certificate (needs the SharePoint application permission Sites.FullControl.All).
+          $spoName = $env:TENANT_DOMAIN -replace '\.onmicrosoft\.com$', ''
+          try { Connect-PnPOnline -Url "https://$spoName-admin.sharepoint.com" -ClientId $env:CLIENT_ID -Tenant $env:TENANT_ID -CertificatePath '/w/app.pfx' -CertificatePassword $pw } catch { Add-Warn 'SharePoint' $_.Exception.Message }
+          # Record which services Maester actually sees as connected, so skipped tests can be explained in Taniwha.
+          $conn = [ordered]@{}
+          foreach ($svc in 'Graph','ExchangeOnline','SecurityCompliance','Teams','SharePointOnline') { try { $conn[$svc] = [bool](Test-MtConnection -Service $svc) } catch { $conn[$svc] = $false } }
+          @{ connections = $conn; warnings = @($warn) } | ConvertTo-Json -Depth 4 | Set-Content /w/connections.json
           New-Item -ItemType Directory /w/tests -Force | Out-Null
           Set-Location /w/tests
           Install-MaesterTests -Path /w/tests
@@ -66,5 +77,9 @@ jobs:
             exit 1
           fi
           # Slim the result (drop large HTML/markdown blobs) and send it.
-          jq -c --arg s "$SCAN_ID" '{scan_id:$s,status:"done",results:{TenantId,ExecutedAt,CurrentVersion,Tests:[.Tests[]|{Name,Result,Tag,ErrorRecord:((.ErrorRecord//[])|map(tostring|.[0:500])),ResultDetail:{TestTitle:.ResultDetail.TestTitle,TestDescription:((.ResultDetail.TestDescription//"")|tostring|.[0:1200]),TestResult:((.ResultDetail.TestResult//"")|tostring|.[0:1200]),Severity:.ResultDetail.Severity,SkippedReason:((.ResultDetail.TestSkipped//.ResultDetail.SkippedReason//"")|tostring|.[0:300])}}]}}' "$WORK/results.json" > "$WORK/payload.json"
+          CONN='{}'
+          if [ -s "$WORK/connections.json" ]; then
+            CONN=$(jq -c '{connections:((.connections//{})|with_entries(select(.value|type=="boolean"))),connection_warnings:((.warnings//[])|map(tostring|.[0:300]|select(test("secret|password|token|kennwort";"i")|not))|.[0:12])}' "$WORK/connections.json" || echo '{}')
+          fi
+          jq -c --arg s "$SCAN_ID" --argjson c "$CONN" '{scan_id:$s,status:"done"} + $c + {results:{TenantId,ExecutedAt,CurrentVersion,Tests:[.Tests[]|{Name,Result,Tag,ErrorRecord:((.ErrorRecord//[])|map(tostring|.[0:500])),ResultDetail:{TestTitle:.ResultDetail.TestTitle,TestDescription:((.ResultDetail.TestDescription//"")|tostring|.[0:1200]),TestResult:((.ResultDetail.TestResult//"")|tostring|.[0:1200]),Severity:.ResultDetail.Severity,SkippedReason:((.ResultDetail.TestSkipped//.ResultDetail.SkippedReason//"")|tostring|.[0:300])}}]}}' "$WORK/results.json" > "$WORK/payload.json"
           curl -sS -m 120 --fail -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" --data-binary "@$WORK/payload.json"
