@@ -45,8 +45,10 @@ jobs:
           foreach ($m in 'Pester','Maester','Microsoft.Graph.Authentication','ExchangeOnlineManagement','MicrosoftTeams','Az.Accounts') {
             Install-Module $m -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck | Out-Null
           }
-          # SharePoint tests use PnP.PowerShell (Get-PnPTenant). Optional: a failed install only skips the SharePoint tests.
-          try { Install-Module PnP.PowerShell -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck | Out-Null } catch { Add-Warn 'PnP.PowerShell' $_.Exception.Message }
+          # Do not load PnP in this process: its assembly resolver caused a fatal
+          # StackOverflowException at Connect-PnPOnline (GitHub run 40789327525).
+          # This cannot be caught by PowerShell try/catch. Keep the working core
+          # suite available; SharePoint requires a separately validated runtime.
           Import-Module Pester, Maester
           $pw = if ($env:CERT_PW) { ConvertTo-SecureString $env:CERT_PW -AsPlainText -Force } else { New-Object System.Security.SecureString }
           $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('/w/app.pfx', $pw, 'Exportable')
@@ -55,9 +57,7 @@ jobs:
           try { Connect-IPPSSession -AppId $env:CLIENT_ID -Certificate $cert -Organization $env:TENANT_DOMAIN -ShowBanner:$false } catch { Add-Warn 'Security & Compliance' $_.Exception.Message }
           try { Connect-MicrosoftTeams -ApplicationId $env:CLIENT_ID -Certificate $cert -TenantId $env:TENANT_ID | Out-Null } catch { Add-Warn 'Teams' $_.Exception.Message }
           try { Connect-AzAccount -ServicePrincipal -ApplicationId $env:CLIENT_ID -CertificatePath '/w/app.pfx' -CertificatePassword $pw -Tenant $env:TENANT_ID | Out-Null } catch { Add-Warn 'Azure' $_.Exception.Message }
-          # SharePoint admin site, app-only with the same certificate (needs the SharePoint application permission Sites.FullControl.All).
-          $spoName = $env:TENANT_DOMAIN -replace '\.onmicrosoft\.com$', ''
-          try { Connect-PnPOnline -Url "https://$spoName-admin.sharepoint.com" -ClientId $env:CLIENT_ID -Tenant $env:TENANT_ID -CertificatePath '/w/app.pfx' -CertificatePassword $pw } catch { Add-Warn 'SharePoint' $_.Exception.Message }
+          Add-Warn 'SharePoint' 'PnP-Anbindung wegen eines Prozessabsturzes vorübergehend deaktiviert; SharePoint-Tests werden übersprungen. Andere Dienste werden weiterhin geprüft.'
           # Record which services Maester actually sees as connected, so skipped tests can be explained in Taniwha.
           $conn = [ordered]@{}
           foreach ($svc in 'Graph','ExchangeOnline','SecurityCompliance','Teams','SharePointOnline') { try { $conn[$svc] = [bool](Test-MtConnection -Service $svc) } catch { $conn[$svc] = $false } }
