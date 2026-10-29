@@ -27,7 +27,9 @@ jobs:
           [[ "$SCAN_ID" =~ ^[0-9a-f-]{36}$ ]] || { echo "bad scan id"; exit 1; }
           [[ "$CALLBACK" =~ ^https://[a-z0-9.-]+/api/public/m365-maester$ ]] || { echo "bad callback"; exit 1; }
           post() { curl -sS -m 30 -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" -d "$1" >/dev/null || true; }
-          WORK=$(mktemp -d); chmod 700 "$WORK"; trap 'rm -rf "$WORK"' EXIT
+          WORK=$(mktemp -d); chmod 700 "$WORK"
+          cleanup() { docker run --rm --entrypoint /usr/bin/find -v "$WORK:/w" mcr.microsoft.com/powershell:lts-ubuntu-22.04 /w -mindepth 1 -delete >/dev/null 2>&1 || true; rm -rf "$WORK" || true; }
+          trap cleanup EXIT
           # One-time pickup of app ID, tenant and certificate from Taniwha.
           curl -sS -m 30 --fail -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" \
             -d "{\"scan_id\":\"$SCAN_ID\",\"action\":\"pickup\"}" -o "$WORK/creds.json" \
@@ -53,8 +55,19 @@ jobs:
           $pw = if ($env:CERT_PW) { ConvertTo-SecureString $env:CERT_PW -AsPlainText -Force } else { New-Object System.Security.SecureString }
           $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('/w/app.pfx', $pw, 'Exportable')
           Connect-MgGraph -ClientId $env:CLIENT_ID -TenantId $env:TENANT_ID -Certificate $cert -NoWelcome
-          try { Connect-ExchangeOnline -AppId $env:CLIENT_ID -Certificate $cert -Organization $env:TENANT_DOMAIN -ShowBanner:$false } catch { Add-Warn 'Exchange Online' $_.Exception.Message }
-          try { Connect-IPPSSession -AppId $env:CLIENT_ID -Certificate $cert -Organization $env:TENANT_DOMAIN -ShowBanner:$false } catch { Add-Warn 'Security & Compliance' $_.Exception.Message }
+          $exoFailed = $false; $complianceFailed = $false
+          try { Connect-ExchangeOnline -AppId $env:CLIENT_ID -Certificate $cert -Organization $env:TENANT_DOMAIN -ShowBanner:$false } catch { $exoFailed = $true; Add-Warn 'Exchange Online' $_.Exception.Message }
+          try { Connect-IPPSSession -AppId $env:CLIENT_ID -Certificate $cert -Organization $env:TENANT_DOMAIN -ShowBanner:$false } catch { $complianceFailed = $true; Add-Warn 'Security & Compliance' $_.Exception.Message }
+          if ($exoFailed -or $complianceFailed) {
+            try {
+              # Read-only Graph check of the exact app permission and directory roles; no permission is changed.
+              $sp = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/servicePrincipals(appId='$($env:CLIENT_ID)')?`$select=id"
+              $assignments = @((Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$($sp.id)/appRoleAssignments").value)
+              $manageAsApp = @($assignments | Where-Object { $_.appRoleId -eq 'dc50a0fb-09a3-484d-be87-e023b12c6440' }).Count -gt 0
+              $roles = @((Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$($sp.id)/transitiveMemberOf/microsoft.graph.directoryRole?`$select=displayName").value | ForEach-Object { $_.displayName })
+              Add-Warn 'Diagnose' ("Exchange.ManageAsApp mit Administrator-Zustimmung: " + $(if ($manageAsApp) { 'ja' } else { 'nein' }) + "; Entra-Rollen der App: " + $(if ($roles.Count) { $roles -join ', ' } else { 'keine' }))
+            } catch { Add-Warn 'Diagnose' ("Exchange-Rechte konnten nicht gelesen werden: " + $_.Exception.Message) }
+          }
           try { Connect-MicrosoftTeams -ApplicationId $env:CLIENT_ID -Certificate $cert -TenantId $env:TENANT_ID | Out-Null } catch { Add-Warn 'Teams' $_.Exception.Message }
           try { Connect-AzAccount -ServicePrincipal -ApplicationId $env:CLIENT_ID -CertificatePath '/w/app.pfx' -CertificatePassword $pw -Tenant $env:TENANT_ID | Out-Null } catch { Add-Warn 'Azure' $_.Exception.Message }
           Add-Warn 'SharePoint' 'PnP-Anbindung wegen eines Prozessabsturzes vorübergehend deaktiviert; SharePoint-Tests werden übersprungen. Andere Dienste werden weiterhin geprüft.'
