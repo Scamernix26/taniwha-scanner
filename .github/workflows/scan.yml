@@ -25,6 +25,7 @@ jobs:
       SCAN_PROFILE: ${{ inputs.scan_profile || 'standard' }}
       PROXY_ENDPOINT: ${{ inputs.proxy_endpoint }}
       SOURCE_REQUIRED: ${{ inputs.source_required }}
+      SAST_SOURCE_DIR: ${{ runner.temp }}/taniwha-source-${{ inputs.scan_id }}
       OPENVAS_PASSWORD: ${{ secrets.OPENVAS_PASSWORD }}
       WPSCAN_API_TOKEN: ${{ secrets.WPSCAN_API_TOKEN }}
     steps:
@@ -47,12 +48,9 @@ jobs:
               assert set(os.environ["TOOLS"].split(",")) <= supported, "Unsupported scan profile/tool combination"
           PY
 
-      - name: SAST source directory
-        run: echo "SAST_SOURCE_DIR=$RUNNER_TEMP/taniwha-source-$SCAN_ID" >> "$GITHUB_ENV"
-
       - name: Status running
         run: |
-          rm -rf reports && mkdir -p reports
+          rm -rf reports && mkdir -p reports/logs && chmod -R 0777 reports
           curl -fsS -X POST "$INGEST_URL" -H "Authorization: Bearer $INGEST_SECRET" -H "Content-Type: application/json" \
             -d "{\"scan_id\":\"$SCAN_ID\",\"status\":\"running\"}"
 
@@ -197,7 +195,7 @@ jobs:
             fi
             set -- "$@" "${extra[@]}"
             ev "$t" info "Startet: $d"
-            mkdir -p reports/logs
+            mkdir -p reports/logs && chmod 0777 reports reports/logs
             local s=$SECONDS rc=0
             echo "\$ docker run --rm --name taniwha-$SCAN_ID-$t $*" > "reports/logs/$t.log"
             docker run --rm --name "taniwha-$SCAN_ID-$t" "$@" >> "reports/logs/$t.log" 2>&1 || rc=$?
@@ -337,7 +335,7 @@ jobs:
           run semgrep "Semgrep Code-Analyse" --cap-drop ALL --security-opt no-new-privileges -e SEMGREP_SEND_METRICS=off -v "$SAST_SOURCE_DIR:/src:ro" -v "$PWD/reports:/reports" returntocorp/semgrep:latest semgrep scan --config p/default --metrics off --disable-version-check --json --output /reports/semgrep-report.json /src
           run gitleaks "Gitleaks Secret-Suche" --cap-drop ALL --security-opt no-new-privileges -v "$SAST_SOURCE_DIR:/repo:ro" -v "$PWD/reports:/reports" zricethezav/gitleaks:latest detect --no-git --redact --source /repo --report-format json --report-path /reports/gitleaks-report.json
           run depcheck "OWASP Dependency-Check" --cap-drop ALL --security-opt no-new-privileges -v "$SAST_SOURCE_DIR:/src:ro" -v "$PWD/reports:/reports" owasp/dependency-check:latest --project App --scan /src --format JSON --out /reports
-          run syft "Syft SBOM-Katalog (Quellcode)" --cap-drop ALL --security-opt no-new-privileges --user root -v "$SAST_SOURCE_DIR:/repo:ro" -v "$PWD/reports:/reports" anchore/syft:latest dir:/repo -o syft-json=/reports/syft-report.json
+          run syft "Syft SBOM-Katalog (Quellcode)" --cap-drop ALL --security-opt no-new-privileges -v "$SAST_SOURCE_DIR:/repo:ro" -v "$PWD/reports:/reports" anchore/syft:latest dir:/repo -o syft-json=/reports/syft-report.json
           # OpenVAS (Greenbone) – läuft als dauerhafter Container "openvas"; Feeds werden beim ersten Start geladen (30–60 min)
           if has openvas; then
             OV_PW="${OPENVAS_PASSWORD:-taniwha-openvas-local}"
