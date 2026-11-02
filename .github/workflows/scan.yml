@@ -25,7 +25,6 @@ jobs:
       SCAN_PROFILE: ${{ inputs.scan_profile || 'standard' }}
       PROXY_ENDPOINT: ${{ inputs.proxy_endpoint }}
       SOURCE_REQUIRED: ${{ inputs.source_required }}
-      SAST_SOURCE_DIR: ${{ runner.temp }}/taniwha-source-${{ inputs.scan_id }}
       OPENVAS_PASSWORD: ${{ secrets.OPENVAS_PASSWORD }}
       WPSCAN_API_TOKEN: ${{ secrets.WPSCAN_API_TOKEN }}
     steps:
@@ -47,6 +46,9 @@ jobs:
           if proxy or os.environ.get("SCAN_PROFILE") == "gentle":
               assert set(os.environ["TOOLS"].split(",")) <= supported, "Unsupported scan profile/tool combination"
           PY
+
+      - name: SAST source directory
+        run: echo "SAST_SOURCE_DIR=$RUNNER_TEMP/taniwha-source-$SCAN_ID" >> "$GITHUB_ENV"
 
       - name: Status running
         run: |
