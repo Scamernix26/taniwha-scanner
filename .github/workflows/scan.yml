@@ -11,6 +11,7 @@ on:
       callback_url: { required: false }
       scan_profile: { required: false, default: standard }
       proxy_endpoint: { required: false } # fixed HTTP endpoint, no credentials
+      source_required: { required: false, default: "false" } # "true" when SAST tools need a code source
 
 jobs:
   scan:
@@ -23,6 +24,8 @@ jobs:
       TOOLS: ${{ inputs.tools }}
       SCAN_PROFILE: ${{ inputs.scan_profile || 'standard' }}
       PROXY_ENDPOINT: ${{ inputs.proxy_endpoint }}
+      SOURCE_REQUIRED: ${{ inputs.source_required }}
+      SAST_SOURCE_DIR: ${{ runner.temp }}/taniwha-source-${{ inputs.scan_id }}
       OPENVAS_PASSWORD: ${{ secrets.OPENVAS_PASSWORD }}
       WPSCAN_API_TOKEN: ${{ secrets.WPSCAN_API_TOKEN }}
     steps:
@@ -50,6 +53,114 @@ jobs:
           rm -rf reports && mkdir -p reports
           curl -fsS -X POST "$INGEST_URL" -H "Authorization: Bearer $INGEST_SECRET" -H "Content-Type: application/json" \
             -d "{\"scan_id\":\"$SCAN_ID\",\"status\":\"running\"}"
+
+      - name: Prepare SAST source
+        run: |
+          python3 - <<'PYSOURCE'
+          import io, json, os, re, shutil, stat, tempfile, urllib.parse, urllib.request, zipfile
+          from pathlib import Path, PurePosixPath
+          MAX_ZIP = 50 * 1024 * 1024
+          MAX_EXPANDED = 250 * 1024 * 1024
+          
+          def safe_extract(data, destination):
+              if len(data) > MAX_ZIP:
+                  raise ValueError('Archive exceeds 50 MB')
+              with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                  entries = archive.infolist()
+                  if len(entries) > 20000 or sum(e.file_size for e in entries) > MAX_EXPANDED:
+                      raise ValueError('Archive expands beyond safe limits')
+                  checked = []
+                  for entry in entries:
+                      name = entry.filename
+                      path = PurePosixPath(name)
+                      mode = entry.external_attr >> 16
+                      if path.is_absolute() or '..' in path.parts or '\\' in name or ':' in name or '\x00' in name:
+                          raise ValueError('Unsafe archive path')
+                      if stat.S_ISLNK(mode) or (stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR)):
+                          raise ValueError('Links and special files are not allowed')
+                      if '.git' not in path.parts:
+                          checked.append((entry, path))
+                  if not any(not e.is_dir() for e, _ in checked):
+                      raise ValueError('Archive has no source files')
+                  destination = Path(destination)
+                  destination.mkdir(parents=True, exist_ok=False)
+                  total = 0
+                  try:
+                      for entry, path in checked:
+                          target = destination.joinpath(*path.parts)
+                          if entry.is_dir():
+                              target.mkdir(parents=True, exist_ok=True)
+                              continue
+                          target.parent.mkdir(parents=True, exist_ok=True)
+                          with archive.open(entry) as src, target.open('xb') as dst:
+                              while True:
+                                  chunk = src.read(65536)
+                                  if not chunk:
+                                      break
+                                  total += len(chunk)
+                                  if total > MAX_EXPANDED:
+                                      raise ValueError('Archive expands beyond safe limits')
+                                  dst.write(chunk)
+                          target.chmod(0o644)
+                  except Exception:
+                      shutil.rmtree(destination, ignore_errors=True)
+                      raise
+          
+          def source_request(action):
+              url = os.environ['INGEST_URL']
+              parsed = urllib.parse.urlsplit(url)
+              if parsed.scheme != 'https' or parsed.path != '/api/public/ingest-results' or parsed.username or parsed.password:
+                  raise ValueError('Invalid callback URL')
+              endpoint = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, '/api/public/scan-source', '', ''))
+              body = json.dumps({'scan_id': os.environ['SCAN_ID'], 'action': action}).encode()
+              request = urllib.request.Request(endpoint, data=body, headers={'Authorization': 'Bearer ' + os.environ['INGEST_SECRET'], 'Content-Type': 'application/json'})
+              # Never forward runner credentials through redirects.
+              class NoRedirect(urllib.request.HTTPRedirectHandler):
+                  def redirect_request(self, req, fp, code, msg, headers, newurl):
+                      return None
+              with urllib.request.build_opener(NoRedirect).open(request, timeout=30) as response:
+                  return json.load(response)
+          
+          def main():
+              tools = set(os.environ['TOOLS'].split(','))
+              if not tools.intersection({'semgrep', 'gitleaks', 'trivy', 'depcheck', 'syft'}):
+                  return
+              if os.environ.get('SOURCE_REQUIRED') != 'true':
+                  raise ValueError('SAST source is required; refusing runner-workspace fallback')
+              try:
+                  source = source_request('pickup')
+                  if source['mode'] == 'repo':
+                      match = re.fullmatch(r'https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+)/?', source['repo_url'])
+                      ref = source['branch']
+                      if not match or any(p in ('.', '..') for p in match.groups()) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,199}', ref) or '..' in ref:
+                          raise ValueError('Invalid repository source')
+                      owner, repo = match.groups()
+                      if repo.endswith('.git'):
+                          repo = repo[:-4]
+                      url = 'https://codeload.github.com/%s/%s/zip/%s' % (owner, repo, urllib.parse.quote(ref, safe=''))
+                  elif source['mode'] == 'upload':
+                      url = source['download_url']
+                      if urllib.parse.urlsplit(url).scheme != 'https':
+                          raise ValueError('Invalid archive URL')
+                  else:
+                      raise ValueError('Unknown source type')
+                  class NoRedirect(urllib.request.HTTPRedirectHandler):
+                      def redirect_request(self, *args): return None
+                  with urllib.request.build_opener(NoRedirect).open(urllib.request.Request(url, headers={'User-Agent': 'Taniwha-SAST'}), timeout=120) as response:
+                      data = response.read(MAX_ZIP + 1)
+                  safe_extract(data, Path(os.environ['SAST_SOURCE_DIR']))
+                  print('SAST code source prepared; repository scripts were not executed.')
+              finally:
+                  source_request('cleanup')
+          
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception:
+                  # Signed URLs, tokens and remote server responses never go to job logs.
+                  print('SAST source preparation failed: repository/ref inaccessible, invalid archive, expired handoff or size limit.')
+                  raise SystemExit(1)
+          PYSOURCE
 
       - name: Run tools
         run: |
@@ -105,6 +216,13 @@ jobs:
           PY
           }
           ev "" info "Scan-Rechner $(hostname) startet – Ziel $TARGET"
+          RATE=50; THREADS=20; KATANA_THREADS=5
+          HAS_WEB=false
+          IFS=, read -ra SELECTED_TOOLS <<< "$TOOLS"
+          for selected in "${SELECTED_TOOLS[@]}"; do
+            case "$selected" in semgrep|gitleaks|trivy|depcheck|syft) ;; *) HAS_WEB=true ;; esac
+          done
+          if [ "$HAS_WEB" = true ]; then
           # CDN/WAF-Erkennung: Ergebnisse spiegeln dann die Schutzschicht, nicht den Ursprungsserver
           CURL_PROXY=()
           [ -z "$PROXY_ENDPOINT" ] || CURL_PROXY=(--proxy "$PROXY_ENDPOINT" --noproxy "")
@@ -120,6 +238,7 @@ jobs:
           # Wortliste für ffuf vorbereiten (einmalig pro Lauf)
           WLIST="$PWD/reports/seclists-common.txt"
           [ -s "$WLIST" ] || curl -fsSL -o "$WLIST" "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" || true
+          fi
           run zap "ZAP Full-Scan (Spider + aktive Angriffe, max. 10 min Spider) auf https://$TARGET" -v "$PWD/reports:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable zap-full-scan.py -t "https://$TARGET" -J zap-report.json -m 10
           run nuclei "Nuclei-Templates (critical/high/medium, $RATE Req/s) gegen https://$TARGET" -v "$PWD/reports:/reports" projectdiscovery/nuclei:latest -u "https://$TARGET" -severity critical,high,medium -jsonl-export /reports/nuclei-report.json -rate-limit "$RATE" -stats -si 30
           # frapsoft/nikto (2.1.x) kennt kein JSON – CSV schreiben und in das Taniwha-Format umrechnen
@@ -212,11 +331,11 @@ jobs:
           run nmapvuln "Nmap-Schwachstellen-Skripte (vuln, Top 100 Ports, max. 20 min) auf $TARGET" -v "$PWD/reports:/reports" instrumentisto/nmap -Pn -sV --top-ports 100 --script vuln --host-timeout 20m -oX /reports/nmapvuln-raw.xml "$TARGET"
           run nmap "Nmap Port-/Service-Scan (Top 1000 Ports) auf $TARGET" instrumentisto/nmap -Pn -sV --top-ports 1000 -oX /reports/nmap-report.xml "$TARGET"
           run sqlmap "SQLMap SQL-Injection-Prüfung (Batch, sanft, Crawl Tiefe 1)" -v "$PWD/reports:/reports" parrotsec/sqlmap -u "https://$TARGET" --batch --forms --crawl=1 --crawl-depth=1 --level=1 --risk=1 --output-dir=/reports/sqlmap --flush-session
-          run trivy "Trivy Abhängigkeits-/Image-Scan" -v "$PWD:/repo" -v "$PWD/reports:/reports" aquasec/trivy:latest fs --format json --output /reports/trivy-report.json /repo
-          run semgrep "Semgrep Code-Analyse" -v "$PWD:/src" -v "$PWD/reports:/reports" returntocorp/semgrep:latest semgrep scan --config auto --json --output /reports/semgrep-report.json /src
-          run gitleaks "Gitleaks Secret-Suche" -v "$PWD:/repo" -v "$PWD/reports:/reports" zricethezav/gitleaks:latest detect --source /repo --report-format json --report-path /reports/gitleaks-report.json
-          run depcheck "OWASP Dependency-Check" -v "$PWD:/src" -v "$PWD/reports:/reports" owasp/dependency-check:latest --project App --scan /src --format JSON --out /reports
-          run syft "Syft SBOM-Katalog (Workspace)" --user root -v "$PWD:/repo" -v "$PWD/reports:/reports" anchore/syft:latest dir:/repo -o syft-json=/reports/syft-report.json
+          run trivy "Trivy Quellcode-Abhängigkeiten" --cap-drop ALL --security-opt no-new-privileges -v "$SAST_SOURCE_DIR:/repo:ro" -v "$PWD/reports:/reports" aquasec/trivy:latest fs --scanners vuln,misconfig --format json --output /reports/trivy-report.json /repo
+          run semgrep "Semgrep Code-Analyse" --cap-drop ALL --security-opt no-new-privileges -e SEMGREP_SEND_METRICS=off -v "$SAST_SOURCE_DIR:/src:ro" -v "$PWD/reports:/reports" returntocorp/semgrep:latest semgrep scan --config p/default --metrics off --disable-version-check --json --output /reports/semgrep-report.json /src
+          run gitleaks "Gitleaks Secret-Suche" --cap-drop ALL --security-opt no-new-privileges -v "$SAST_SOURCE_DIR:/repo:ro" -v "$PWD/reports:/reports" zricethezav/gitleaks:latest detect --no-git --redact --source /repo --report-format json --report-path /reports/gitleaks-report.json
+          run depcheck "OWASP Dependency-Check" --cap-drop ALL --security-opt no-new-privileges -v "$SAST_SOURCE_DIR:/src:ro" -v "$PWD/reports:/reports" owasp/dependency-check:latest --project App --scan /src --format JSON --out /reports
+          run syft "Syft SBOM-Katalog (Quellcode)" --cap-drop ALL --security-opt no-new-privileges --user root -v "$SAST_SOURCE_DIR:/repo:ro" -v "$PWD/reports:/reports" anchore/syft:latest dir:/repo -o syft-json=/reports/syft-report.json
           # OpenVAS (Greenbone) – läuft als dauerhafter Container "openvas"; Feeds werden beim ersten Start geladen (30–60 min)
           if has openvas; then
             OV_PW="${OPENVAS_PASSWORD:-taniwha-openvas-local}"
@@ -514,17 +633,31 @@ jobs:
                       f.append({"title": "TLS-Kompression aktiv (CRIME) (SSLyze)", "description": "TLS-Kompression ermöglicht den CRIME-Angriff.", "severity": "medium", "url": host, "evidence": "SSLyze: supports_compression = true"})
                   rn = r("session_renegotiation")
                   if rn.get("is_vulnerable_to_client_renegotiation_dos") or rn.get("supports_secure_renegotiation") is False:
-                      f.append({"title": "Unsichere TLS-Renegotiation (SSLyze)", "description": "Der Server erlaubt unsichere Session-Renegotiation.", "severity": "medium", "url": host, "evidence": "SSLyze renegotiation: %s" % rn})
+                      f.append({"title": "Unsichere TLS-Renegotiation (SSLyze)", "description": "Der Server erlaubt unsichere oder DoS-anfällige Renegotiation.", "severity": "medium", "url": host, "evidence": json.dumps(rn)})
+                  for dep in r("certificate_info").get("certificate_deployments") or []:
+                      for pv in dep.get("path_validation_results") or []:
+                          if pv.get("was_validation_successful") is False:
+                              f.append({"title": "Zertifikat nicht vertrauenswürdig (SSLyze)", "description": "Die Zertifikatskette wurde gegen den Truststore '%s' nicht akzeptiert." % ((pv.get("trust_store") or {}).get("name") or "?"),
+                                        "severity": "high", "url": host, "evidence": "Truststore: %s\nFehler: %s" % ((pv.get("trust_store") or {}).get("name"), pv.get("validation_error"))})
+                              break
           except Exception: pass
           save("sslyze", f)
-          # whatweb
+          # whatweb: Technik-Inventar
           f = []
           try:
-              for d in json.load(open("reports/whatweb-raw.json", encoding="utf-8", errors="replace")):
-                  where = d.get("target") or T
-                  for pl, info in (d.get("plugins") or {}).items():
-                      vers = (info.get("version") or []) if isinstance(info, dict) else []
-                      f.append(comp(pl, str(vers[0]) if vers else "", "WhatWeb", where))
+              raw = open("reports/whatweb-raw.json", encoding="utf-8", errors="replace").read().strip()
+              try: data = json.loads(raw)
+              except ValueError: data = [json.loads(l.strip().rstrip(",")) for l in raw.splitlines() if l.strip().startswith("{")]
+              if isinstance(data, dict): data = [data]
+              for d in data:
+                  where = d.get("target") or "https://%s" % T
+                  for name, info in (d.get("plugins") or {}).items():
+                      if name in ("HTTPServer", "IP", "Country", "Title", "UncommonHeaders", "HTML5", "Email", "Cookies", "HttpOnly", "Strict-Transport-Security", "RedirectLocation", "Meta-Refresh-Redirect", "Script", "X-Frame-Options", "X-XSS-Protection", "X-UA-Compatible", "PasswordField", "Open-Graph-Protocol", "Content-Language", "Via-Proxy", "ETag", "Frame", "Access-Control-Allow-Methods", "X-Powered-By"):
+                          if name == "X-Powered-By":
+                              for v in (info.get("string") or []): f.append(comp("X-Powered-By " + str(v), "", "WhatWeb", where))
+                          continue
+                      vers = info.get("version") or []
+                      f.append(comp(name, str(vers[0]) if vers else "", "WhatWeb", where))
           except Exception: pass
           seen = set(); f = [x for x in f if not (x["title"] in seen or seen.add(x["title"]))]
           save("whatweb", f)
@@ -626,6 +759,26 @@ jobs:
           PY
             curl -fsS -X POST "$INGEST_URL" -H "Authorization: Bearer $INGEST_SECRET" -H "Content-Type: application/json" --data-binary @payload.json || true
           done
+
+      - name: Remove SAST source
+        if: always()
+        run: |
+          case "$SAST_SOURCE_DIR" in "$RUNNER_TEMP"/taniwha-source-*) rm -rf -- "$SAST_SOURCE_DIR" ;; *) exit 1 ;; esac
+          if [ "$SOURCE_REQUIRED" = true ]; then
+            python3 - <<'PYCLEAN'
+          import json, os, urllib.parse, urllib.request
+          p = urllib.parse.urlsplit(os.environ['INGEST_URL'])
+          u = urllib.parse.urlunsplit((p.scheme, p.netloc, '/api/public/scan-source', '', ''))
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args): return None
+          r = urllib.request.Request(u, data=json.dumps({'scan_id': os.environ['SCAN_ID'], 'action': 'cleanup'}).encode(), headers={'Authorization': 'Bearer '+os.environ['INGEST_SECRET'], 'Content-Type': 'application/json'})
+          try:
+              with urllib.request.build_opener(NoRedirect).open(r, timeout=30) as response: response.read()
+          except Exception:
+              print('Private archive cleanup failed; remove the upload in Taniwha.')
+              raise SystemExit(1)
+          PYCLEAN
+          fi
 
       - name: Status done
         if: success()
