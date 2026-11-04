@@ -1,0 +1,103 @@
+# Place at .github/workflows/m365-ir.yml in the scanner repository.
+# Incident-response mode ("Vorfalluntersuchung") – separate from the Maester/assessment runs.
+# Requires a SELF-HOSTED WINDOWS runner with the label "windows-ir" (Windows PowerShell 5.1 + PowerShell 7).
+#
+# LICENCE CHECKPOINT (needs internal legal confirmation before production use):
+#   Microsoft-Analyzer-Suite (evild3ad) is GPL-3.0. It is downloaded fresh from its original source at run time and
+#   executed only as a separate process. No Analyzer code is copied into Taniwha or into this repository, and the
+#   runner image must not bundle/redistribute it. Microsoft-Extractor-Suite (Invictus IR) licence: verify and record.
+#
+# Flow: one-time credential pickup (deleted on pickup) -> Extractor (app certificate, read-only, case time window)
+#       -> Analyzer -> CSV outputs posted to /api/public/m365-ir -> stored only in m365_ir_* tables.
+# Only repository secret needed: RUNNER_INGEST_SECRET.
+#
+# NOTE: ANALYZER_REF is pinned to a reviewed release tag. Script names/parameters change between releases; re-check the
+# analyzer-to-input mapping below before bumping the tag (not yet verified on a live runner).
+name: M365 Incident Response
+run-name: M365 IR ${{ inputs.case_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      case_id: { required: true }
+      callback_url: { required: true }
+
+concurrency: { group: m365-ir, cancel-in-progress: false }
+
+jobs:
+  ir:
+    runs-on: [self-hosted, windows, windows-ir]
+    timeout-minutes: 360
+    env:
+      CASE_ID: ${{ inputs.case_id }}
+      CALLBACK: ${{ inputs.callback_url }}
+      INGEST: ${{ secrets.RUNNER_INGEST_SECRET }}
+      ANALYZER_REPO: https://github.com/LETHAL-FORENSICS/Microsoft-Analyzer-Suite   # moved from evild3ad
+      ANALYZER_REF: v1.9.0   # pinned, reviewed release tag (2026-07-06); update only after review
+    steps:
+      - name: Extract and analyse (read-only)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:CASE_ID -notmatch '^[0-9a-f-]{36}$') { throw 'bad case id' }
+          if ($env:CALLBACK -notmatch '^https://[a-z0-9.-]+/api/public/m365-ir$') { throw 'bad callback' }
+          $H = @{ Authorization = "Bearer $env:INGEST" }
+          function Post($o) { try { Invoke-RestMethod -Method Post -Uri $env:CALLBACK -Headers $H -ContentType 'application/json' -Body ($o | ConvertTo-Json -Depth 6 -Compress) -TimeoutSec 120 | Out-Null } catch { Write-Warning $_ } }
+          $work = Join-Path $env:RUNNER_TEMP ("ir-" + [guid]::NewGuid()); New-Item -ItemType Directory $work | Out-Null
+          try {
+            $creds = Invoke-RestMethod -Method Post -Uri $env:CALLBACK -Headers $H -ContentType 'application/json' -Body (@{ case_id = $env:CASE_ID; action = 'pickup' } | ConvertTo-Json) -TimeoutSec 30
+          } catch { Post @{ case_id = $env:CASE_ID; status = 'failed'; note = 'Zugangsdaten nicht abholbar (abgelaufen oder bereits abgeholt).' }; throw }
+          try {
+            if ($creds.tenant_domain -notmatch '^[a-z0-9-]+\.onmicrosoft\.com$') { throw 'Ungültige Tenant-Domain' }
+            $pfx = Join-Path $work 'app.pfx'; [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($creds.cert_b64))
+            if ($creds.cert_pw) { Write-Host "::add-mask::$($creds.cert_pw)" }
+            $pw = if ($creds.cert_pw) { ConvertTo-SecureString $creds.cert_pw -AsPlainText -Force } else { New-Object Security.SecureString }
+            $cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($pfx, $pw, 'Exportable')
+            $start = [datetime]$creds.window_start; $end = [datetime]$creds.window_end
+            Post @{ case_id = $env:CASE_ID; status = 'running'; note = 'Extractor läuft (lesend)' }
+
+            Set-PSRepository PSGallery -InstallationPolicy Trusted
+            foreach ($m in 'Microsoft-Extractor-Suite','Microsoft.Graph.Authentication','ExchangeOnlineManagement') { Install-Module $m -Scope CurrentUser -Force -AllowClobber | Out-Null }
+            Import-Module Microsoft-Extractor-Suite
+            Connect-MgGraph -ClientId $creds.client_id -TenantId $creds.tenant_id -Certificate $cert -NoWelcome
+            Connect-ExchangeOnline -AppId $creds.client_id -Certificate $cert -Organization $creds.tenant_domain -ShowBanner:$false
+            $out = Join-Path $work 'extract'; New-Item -ItemType Directory $out | Out-Null
+            $users = @($creds.accounts)
+            # Read-only collection for the case window (cmdlets of Microsoft-Extractor-Suite).
+            if ($users.Count) { Get-UAL -StartDate $start -EndDate $end -UserIds ($users -join ',') -OutputDir $out } else { Get-UAL -StartDate $start -EndDate $end -OutputDir $out }
+            Get-GraphEntraSignInLogs -StartDate $start -EndDate $end -OutputDir $out
+            Get-GraphEntraAuditLogs -StartDate $start -EndDate $end -OutputDir $out
+            Get-MailboxRules -OutputDir $out
+            Get-OAuthPermissionsGraph -OutputDir $out
+
+            Post @{ case_id = $env:CASE_ID; status = 'running'; note = 'Analyzer läuft' }
+            $az = Join-Path $work 'analyzer'
+            git clone --depth 1 --branch $env:ANALYZER_REF $env:ANALYZER_REPO $az
+            $res = Join-Path $work 'analysis'; New-Item -ItemType Directory $res | Out-Null
+            # Separate process per analyzer script (GPL-3.0 boundary). Each analyzer gets the extractor output it expects;
+            # analyzers without a matching input are skipped and reported in the status note.
+            $analyzerInputs = [ordered]@{
+              'UAL-Analyzer.ps1'              = '*UAL*.csv'
+              'EntraSignInLogs-Analyzer.ps1'  = '*SignInLogs*.json'
+              'EntraAuditLogs-Analyzer.ps1'   = '*AuditLogs*.json'
+              'OAuthPermissions-Analyzer.ps1' = '*OAuthPermissions*.csv'
+            }
+            $skipped = [System.Collections.Generic.List[string]]::new()
+            foreach ($name in $analyzerInputs.Keys) {
+              $script = Get-ChildItem $az -Filter $name -Recurse | Select-Object -First 1
+              if (-not $script) { $skipped.Add("$name (nicht im Release)"); continue }
+              $inFile = Get-ChildItem $out -Recurse -Filter $analyzerInputs[$name] | Sort-Object Length -Descending | Select-Object -First 1
+              if (-not $inFile) { $skipped.Add("$name (keine Eingabe $($analyzerInputs[$name]))"); continue }
+              & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script.FullName -Path $inFile.FullName -OutputDir $res 2>&1 | Out-Host
+            }
+            $files = @(Get-ChildItem $res -Recurse -Filter *.csv | Select-Object -First 200 | ForEach-Object {
+              $t = Get-Content $_.FullName -Raw -Encoding UTF8; if ($t.Length -gt 5000000) { $t = $t.Substring(0, 5000000) }
+              @{ name = $_.Name; csv = $t }
+            })
+            $ver = (Get-Module Microsoft-Extractor-Suite).Version.ToString()
+            Post @{ case_id = $env:CASE_ID; status = 'done'; note = ("$($files.Count) Analyzer-Dateien" + $(if ($skipped.Count) { "; übersprungen: " + ($skipped -join ', ') } else { '' })); files = $files; tools = @{ 'Microsoft-Extractor-Suite' = $ver; 'Microsoft-Analyzer-Suite' = $env:ANALYZER_REF } }
+          } catch {
+            Post @{ case_id = $env:CASE_ID; status = 'failed'; note = ("Fehler: " + ($_.Exception.Message -replace '\s+', ' ')).Substring(0, [Math]::Min(500, ("Fehler: " + $_.Exception.Message).Length)) }
+            throw
+          } finally {
+            Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+          }
