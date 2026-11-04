@@ -1,0 +1,290 @@
+# Place at .github/workflows/m365-ual.yml in the scanner repository.
+# Collects the Unified Audit Log (Exchange, SharePoint, Teams, Entra ID) via
+# the Microsoft Purview / Compliance API and sends structured events to Taniwha.
+#
+# Required repository secret: RUNNER_INGEST_SECRET
+# App registration credentials are picked up one-time from Taniwha.
+# Required app permissions (READ-ONLY, Application):
+#   AuditLog.Read.All
+#   (For UAL via Purview also: compliance.microsoft.com access)
+#
+# Lookback window: configurable via input (default: 30 days, max: 180)
+# Windows that hit the 50,000-record ReturnLargeSet cap are split (daily, then halved down to 1 h);
+# windows still at the cap are reported to Taniwha as "unvollständig" instead of being silently cut.
+# Note: the Office 365 Management Activity API only reaches ~7 days back and is not suitable for assessments.
+name: M365 UAL Collection
+run-name: M365-UAL ${{ inputs.scan_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_id:        { required: true }
+      callback_url:   { required: true }   # https://<platform>/api/public/m365-ual
+      lookback_days:
+        required: false
+        default: "30"
+        description: "Wie viele Tage zurück (max 180)"
+
+concurrency:
+  group: m365-ual
+  cancel-in-progress: false
+
+jobs:
+  collect-ual:
+    runs-on: self-hosted
+    timeout-minutes: 120
+    env:
+      SCAN_ID:       ${{ inputs.scan_id }}
+      CALLBACK:      ${{ inputs.callback_url }}
+      INGEST:        ${{ secrets.RUNNER_INGEST_SECRET }}
+      LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$SCAN_ID" =~ ^[0-9a-f-]{36}$ ]] || { echo "ungültige scan_id"; exit 1; }
+          [[ "$CALLBACK" =~ ^https://[a-zA-Z0-9./-]+$ ]] || { echo "ungültige callback_url"; exit 1; }
+          [[ "$LOOKBACK_DAYS" =~ ^[0-9]+$ && "$LOOKBACK_DAYS" -le 180 ]] || LOOKBACK_DAYS=30
+          echo "LOOKBACK_DAYS=$LOOKBACK_DAYS" >> "$GITHUB_ENV"
+
+      - name: Pick up credentials from Taniwha
+        run: |
+          WORK=$(mktemp -d); chmod 700 "$WORK"
+          echo "WORK=$WORK" >> "$GITHUB_ENV"
+
+          post() { curl -sS -m 30 -X POST "$CALLBACK" \
+            -H "Authorization: Bearer $INGEST" \
+            -H "Content-Type: application/json" \
+            -d "$1" >/dev/null || true; }
+
+          curl -sS -m 30 --fail \
+            -X POST "$CALLBACK" \
+            -H "Authorization: Bearer $INGEST" \
+            -H "Content-Type: application/json" \
+            -d "{\"scan_id\":\"$SCAN_ID\",\"action\":\"pickup\"}" \
+            -o "$WORK/creds.json" || {
+              post "$(jq -nc --arg s "$SCAN_ID" \
+                '{scan_id:$s,status:"failed",note:"Zugangsdaten nicht abholbar."}')"
+              exit 1
+            }
+
+          CLIENT_ID=$(jq -r .client_id     "$WORK/creds.json")
+          TENANT_ID=$(jq -r .tenant_id     "$WORK/creds.json")
+          TENANT_DOMAIN=$(jq -r .tenant_domain "$WORK/creds.json")
+          CERT_PW=$(jq -r .cert_pw         "$WORK/creds.json")
+
+          [ -n "$CERT_PW" ] && echo "::add-mask::$CERT_PW"
+
+          jq -r .cert_b64 "$WORK/creds.json" | base64 -d > "$WORK/app.pfx"
+          chmod 600 "$WORK/app.pfx"
+          rm -f "$WORK/creds.json"
+
+          echo "CLIENT_ID=$CLIENT_ID"           >> "$GITHUB_ENV"
+          echo "TENANT_ID=$TENANT_ID"           >> "$GITHUB_ENV"
+          echo "TENANT_DOMAIN=$TENANT_DOMAIN"   >> "$GITHUB_ENV"
+          echo "CERT_PW=$CERT_PW"               >> "$GITHUB_ENV"
+
+          [[ "$TENANT_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
+            post "$(jq -nc --arg s "$SCAN_ID" '{scan_id:$s,status:"failed",note:"Ungültige Tenant-ID."}')"
+            exit 1
+          }
+
+          post "$(jq -nc --arg s "$SCAN_ID" --arg d "$LOOKBACK_DAYS" \
+            '{scan_id:$s,status:"running",note:("UAL-Sammlung gestartet, Zeitfenster: "+$d+" Tage")}')"
+
+      - name: Collect UAL via PowerShell (Exchange Online / Purview)
+        run: |
+          post() { curl -sS -m 30 -X POST "$CALLBACK" \
+            -H "Authorization: Bearer $INGEST" \
+            -H "Content-Type: application/json" \
+            -d "$1" >/dev/null || true; }
+
+          cat > "$WORK/collect-ual.ps1" <<'PS'
+          $ErrorActionPreference = 'Stop'
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+
+          # Module installieren
+          foreach ($m in 'ExchangeOnlineManagement','Microsoft.Graph.Authentication') {
+            if (-not (Get-Module -ListAvailable $m)) {
+              Install-Module $m -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck | Out-Null
+            }
+          }
+          Import-Module ExchangeOnlineManagement, Microsoft.Graph.Authentication
+
+          # Zertifikat laden
+          $pw   = if ($env:CERT_PW) { ConvertTo-SecureString $env:CERT_PW -AsPlainText -Force } `
+                  else { New-Object System.Security.SecureString }
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            '/w/app.pfx', $pw, 'Exportable')
+
+          # Verbinden
+          Connect-ExchangeOnline -AppId $env:CLIENT_ID -Certificate $cert `
+            -Organization $env:TENANT_DOMAIN -ShowBanner:$false
+          Connect-MgGraph -ClientId $env:CLIENT_ID -TenantId $env:TENANT_ID `
+            -Certificate $cert -NoWelcome
+
+          $lookback = [int]$env:LOOKBACK_DAYS
+          $start    = (Get-Date).AddDays(-$lookback).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $end      = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+          # UAL-Record-Typen die Taniwha auswertet
+          $recordTypes = @(
+            'ExchangeAdmin',        # Set-InboxRule, Set-Mailbox, etc.
+            'ExchangeItem',         # HardDelete, MoveToDeletedItems
+            'SharePoint',           # FileDownloaded, FileDeleted
+            'SharePointFileOperation',
+            'ExchangeItemAggregated', # MailItemsAccessed
+            'AzureActiveDirectory', # Entra ID Änderungen
+            'AzureActiveDirectoryStsLogon',
+            'MicrosoftTeams',       # TeamsMessage, MeetingParticipantDetail
+            'SecurityComplianceCenter',
+            'OneDrive'
+          )
+
+          $allEvents  = [System.Collections.Generic.List[PSObject]]::new()
+          $incomplete = [System.Collections.Generic.List[PSObject]]::new()
+          $cap        = 50000     # ReturnLargeSet: max. 50.000 Einträge pro Session
+          $minSpan    = [TimeSpan]::FromHours(1)
+
+          function Add-Results($results) {
+            foreach ($r in $results) {
+              $auditData = $null
+              try { $auditData = $r.AuditData | ConvertFrom-Json } catch {}
+              $allEvents.Add([PSCustomObject]@{
+                record_type  = "$($r.RecordType)"
+                operation    = $r.Operations
+                user_id      = $r.UserIds
+                user_key     = $auditData?.UserId ?? $r.UserIds
+                workload     = $auditData?.Workload
+                client_ip    = $auditData?.ClientIP ?? $auditData?.ActorIpAddress
+                object_id    = $auditData?.ObjectId ?? $auditData?.TargetObjectId
+                occurred_at  = $r.CreationDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                raw          = $r.AuditData
+              })
+            }
+          }
+
+          # Liest ein Zeitfenster vollständig. Erreicht die Session die 50.000er-Grenze, wird das Fenster
+          # aufgeteilt (erst tageweise, dann halbiert bis 1 h) statt still abzuschneiden. Bleibt es voll -> "unvollständig".
+          function Read-Window([string]$rt, [datetime]$from, [datetime]$to) {
+            $session = "$rt-$env:SCAN_ID-$($from.Ticks)"
+            $buffer  = [System.Collections.Generic.List[PSObject]]::new()
+            do {
+              $results = Search-UnifiedAuditLog -StartDate $from -EndDate $to -RecordType $rt `
+                -ResultSize 5000 -SessionId $session -SessionCommand ReturnLargeSet
+              if ($results) { $buffer.AddRange([PSObject[]]$results) }
+            } while ($results -and $results.Count -eq 5000 -and $buffer.Count -lt $cap)
+            if ($buffer.Count -lt $cap) { Add-Results $buffer; Write-Host "  ${rt} $($from.ToString('u'))–$($to.ToString('u')): $($buffer.Count)"; return }
+            $span = $to - $from
+            if ($span -le $minSpan) {
+              Add-Results $buffer
+              $incomplete.Add([PSCustomObject]@{ start = $from.ToString("yyyy-MM-ddTHH:mm:ssZ"); end = $to.ToString("yyyy-MM-ddTHH:mm:ssZ"); record_type = $rt })
+              Write-Warning "${rt}: Fenster $($from.ToString('u')) trotz Aufteilung an der Grenze – unvollständig"
+              return
+            }
+            $step = if ($span.TotalDays -gt 1) { [TimeSpan]::FromDays(1) } else { [TimeSpan]::FromTicks([Math]::Max($minSpan.Ticks, [long]($span.Ticks / 2))) }
+            for ($t = $from; $t -lt $to; $t = $t + $step) {
+              $e = if (($t + $step) -lt $to) { $t + $step } else { $to }
+              Read-Window $rt $t $e
+            }
+          }
+
+          $startDt = [datetime]::Parse($start).ToUniversalTime()
+          $endDt   = [datetime]::Parse($end).ToUniversalTime()
+          foreach ($rt in $recordTypes) {
+            try { Write-Host "Sammle: $rt ..."; Read-Window $rt $startDt $endDt }
+            catch { Write-Warning "${rt}: $($_.Exception.Message)"; $incomplete.Add([PSCustomObject]@{ start = $start; end = $end; record_type = $rt }) }
+          }
+
+          Write-Host "Gesamt: $($allEvents.Count) UAL-Events, unvollständige Fenster: $($incomplete.Count)"
+          ConvertTo-Json -InputObject @($allEvents) -Depth 5 -Compress | Set-Content /w/ual-events.json -Encoding UTF8
+          ConvertTo-Json -InputObject @{ start = $start; end = $end; incomplete = @($incomplete) } -Depth 4 -Compress | Set-Content /w/ual-meta.json -Encoding UTF8
+          Write-Host "Fertig."
+          PS
+
+          docker run --rm \
+            --name "taniwha-ual-$SCAN_ID" \
+            -v "$WORK:/w" \
+            -e CLIENT_ID \
+            -e TENANT_ID \
+            -e TENANT_DOMAIN \
+            -e CERT_PW \
+            -e SCAN_ID \
+            -e LOOKBACK_DAYS \
+            mcr.microsoft.com/powershell:lts-ubuntu-22.04 \
+            pwsh -NoProfile -File /w/collect-ual.ps1 \
+            2>&1 | tail -n 200 | tee "$RUNNER_TEMP/ual.log" || true
+
+          if [ ! -s "$WORK/ual-events.json" ]; then
+            NOTE=$(tail -c 1000 "$RUNNER_TEMP/ual.log" | grep -viE 'secret|password|cert' || true)
+            post "$(jq -nc --arg s "$SCAN_ID" --arg n "UAL-Sammlung fehlgeschlagen: $NOTE" \
+              '{scan_id:$s,status:"failed",note:$n}')"
+            exit 1
+          fi
+
+          EVENT_COUNT=$(jq 'length' "$WORK/ual-events.json" 2>/dev/null || echo "?")
+          post "$(jq -nc --arg s "$SCAN_ID" --arg n "$EVENT_COUNT UAL-Events gesammelt, übertrage an Taniwha" \
+            '{scan_id:$s,status:"running",note:$n}')"
+
+      - name: Send UAL events to Taniwha (chunked)
+        run: |
+          post() { curl -sS -m 30 -X POST "$CALLBACK" \
+            -H "Authorization: Bearer $INGEST" \
+            -H "Content-Type: application/json" \
+            -d "$1" >/dev/null || true; }
+
+          # In 500er-Chunks senden damit der Payload nicht zu groß wird
+          python3 - "$WORK/ual-events.json" "$SCAN_ID" "$CALLBACK" "$INGEST" "$WORK/ual-meta.json" <<'PY'
+          import json, sys, urllib.request, math
+
+          events_file, scan_id, callback, secret, meta_file = sys.argv[1:6]
+          with open(meta_file, encoding="utf-8") as f:
+              meta = json.load(f)
+
+          with open(events_file, encoding="utf-8") as f:
+              events = json.load(f)
+
+          if not isinstance(events, list):
+              events = [events]
+
+          chunk_size = 500
+          total      = len(events)
+          chunks     = math.ceil(total / chunk_size) if total else 1
+
+          print(f"Sende {total} Events in {chunks} Chunks", flush=True)
+
+          for i in range(chunks):
+              chunk   = events[i * chunk_size:(i + 1) * chunk_size]
+              payload = json.dumps({
+                  "scan_id":     scan_id,
+                  "status":      "done" if i == chunks - 1 else "partial",
+                  "source":      "ual",
+                  "chunk":       i + 1,
+                  "total_chunks": chunks,
+                  "events":      chunk,
+                  "window_start": meta.get("start"),
+                  "window_end":   meta.get("end"),
+                  "incomplete_windows": (meta.get("incomplete") or []) if i == chunks - 1 else [],
+              }).encode()
+
+              req = urllib.request.Request(
+                  callback,
+                  data=payload,
+                  headers={
+                      "Content-Type":  "application/json",
+                      "Authorization": f"Bearer {secret}",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=120):
+                      pass
+                  print(f"  Chunk {i+1}/{chunks} OK", flush=True)
+              except Exception as e:
+                  print(f"  Chunk {i+1}/{chunks} FEHLER: {e}", flush=True)
+                  sys.exit(1)
+          PY
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf "$WORK" || true
