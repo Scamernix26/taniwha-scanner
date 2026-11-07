@@ -1,4 +1,5 @@
 # Place at .github/workflows/maester.yml in the scanner repository (same self-hosted runner as scan.yml).
+# Runs the COMPLETE Maester suite and afterwards EntraFalcon (Compass Security, read-only, same app certificate)
 # Runs the COMPLETE Maester suite (Maester, EIDSCA, CISA/ScubaGear, CIS tests) in a PowerShell container, read-only.
 # Only repository secret needed: RUNNER_INGEST_SECRET. App ID, tenant and certificate are entered in the Taniwha UI
 # and picked up exactly once from Taniwha (deleted on pickup, never written to GitHub).
@@ -80,9 +81,27 @@ jobs:
           Install-MaesterTests -Path /w/tests
           Invoke-Maester -Path /w/tests -OutputJsonFile /w/results.json -NonInteractive -SkipGraphConnect -DisableTelemetry | Out-Null
           PS
+          cat > "$WORK/ef.ps1" <<'PS'
+          # EntraFalcon: separate process so a failure never affects the Maester result. Read-only Graph REST calls.
+          $ErrorActionPreference = 'Stop'
+          try {
+            Set-Location /tmp
+            git clone --depth 1 https://github.com/CompassSecurity/EntraFalcon.git /tmp/ef 2>&1 | Out-Null
+            Set-Location /tmp/ef
+            New-Item -ItemType Directory /w/ef -Force | Out-Null
+            $efPassword = if ($env:CERT_PW) { ConvertTo-SecureString $env:CERT_PW -AsPlainText -Force } else { New-Object System.Security.SecureString }
+            ./run_EntraFalcon.ps1 -AuthFlow ServicePrincipal -Tenant $env:TENANT_ID -SPClientId $env:CLIENT_ID -SPCertificatePath /w/app.pfx -SPCertificatePassword $efPassword -ExportFindingsJson -OutputFolder /w/ef | Out-Null
+          } catch { ("EntraFalcon: " + ($_.Exception.Message -replace '\s+',' ')).Substring(0,[Math]::Min(900, 12 + $_.Exception.Message.Length)) | Set-Content /w/ef_note.txt }
+          PS
           docker run --rm --name "taniwha-maester-$SCAN_ID" -v "$WORK:/w" \
             -e CLIENT_ID -e TENANT_ID -e TENANT_DOMAIN -e CERT_PW \
             mcr.microsoft.com/powershell:lts-ubuntu-22.04 pwsh -NoProfile -File /w/run.ps1 2>&1 | tail -n 400 | tee "$RUNNER_TEMP/maester.log" || true
+          docker run --rm --name "taniwha-entrafalcon-$SCAN_ID" -v "$WORK:/w" -e CLIENT_ID -e TENANT_ID -e CERT_PW \
+            mcr.microsoft.com/powershell:lts-ubuntu-22.04 bash -c 'apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null && pwsh -NoProfile -File /w/ef.ps1' 2>&1 | tail -n 100 || true
+          EF_FILE=$(find "$WORK/ef" -name 'tenant_findings_all_*.json' 2>/dev/null | head -n1 || true)
+          EF_NOTE=$(cat "$WORK/ef_note.txt" 2>/dev/null | grep -viE 'secret|password|token' | head -c 900 || true)
+          [ -z "$EF_FILE" ] && [ -z "$EF_NOTE" ] && EF_NOTE="EntraFalcon lieferte keine Findings-Datei."
+          echo null > "$WORK/ef_payload.json"; [ -n "$EF_FILE" ] && { jq -c '(if type=="array" then . else (.findings//[]) end)|map(select(.Status=="Vulnerable" or .Status=="Skipped"))' "$EF_FILE" > "$WORK/ef_payload.json" 2>/dev/null || echo null > "$WORK/ef_payload.json"; }
           if [ ! -s "$WORK/results.json" ]; then
             NOTE=$(tail -c 1500 "$RUNNER_TEMP/maester.log" | grep -viE 'secret|password|token' || true)
             curl -sS -m 30 -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" \
@@ -94,5 +113,5 @@ jobs:
           if [ -s "$WORK/connections.json" ]; then
             CONN=$(jq -c '{connections:((.connections//{})|with_entries(select(.value|type=="boolean"))),connection_warnings:((.warnings//[])|map(tostring|.[0:300]|select(test("secret|password|token|kennwort";"i")|not))|.[0:12])}' "$WORK/connections.json" || echo '{}')
           fi
-          jq -c --arg s "$SCAN_ID" --argjson c "$CONN" '{scan_id:$s,status:"done"} + $c + {results:{TenantId,ExecutedAt,CurrentVersion,Tests:[.Tests[]|{Name,Result,Tag,ErrorRecord:((.ErrorRecord//[])|map(tostring|.[0:500])),ResultDetail:{TestTitle:.ResultDetail.TestTitle,TestDescription:((.ResultDetail.TestDescription//"")|tostring|.[0:1200]),TestResult:((.ResultDetail.TestResult//"")|tostring|.[0:1200]),Severity:.ResultDetail.Severity,SkippedReason:((.ResultDetail.TestSkipped//.ResultDetail.SkippedReason//"")|tostring|.[0:300])}}]}}' "$WORK/results.json" > "$WORK/payload.json"
+          jq -c --arg s "$SCAN_ID" --argjson c "$CONN" '{scan_id:$s,status:"done"} + $c + {results:{TenantId,ExecutedAt,CurrentVersion,Tests:[.Tests[]|{Name,Result,Tag,ErrorRecord:((.ErrorRecord//[])|map(tostring|.[0:500])),ResultDetail:{TestTitle:.ResultDetail.TestTitle,TestDescription:((.ResultDetail.TestDescription//"")|tostring|.[0:1200]),TestResult:((.ResultDetail.TestResult//"")|tostring|.[0:1200]),Severity:.ResultDetail.Severity,SkippedReason:((.ResultDetail.TestSkipped//.ResultDetail.SkippedReason//"")|tostring|.[0:300])}}]}}' "$WORK/results.json" | jq -c --slurpfile ef "$WORK/ef_payload.json" --arg en "$EF_NOTE" '. + {entrafalcon:$ef[0], entrafalcon_note:$en}' > "$WORK/payload.json"
           curl -sS -m 120 --fail -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" --data-binary "@$WORK/payload.json"
