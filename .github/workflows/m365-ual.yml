@@ -1,16 +1,25 @@
 # Place at .github/workflows/m365-ual.yml in the scanner repository.
-# Collects the Unified Audit Log (Exchange, SharePoint, Teams, Entra ID) via
-# the Microsoft Purview / Compliance API and sends structured events to Taniwha.
+# Collects the Unified Audit Log, the Exchange Online state (Get-* only) and an offline-enriched sign-in baseline
+# for Taniwha's Low-License-Assessment (tenants without Defender XDR / Entra P2). STRICTLY READ-ONLY.
 #
-# Required repository secret: RUNNER_INGEST_SECRET
+# Required repository secrets: RUNNER_INGEST_SECRET, IPINFO_TOKEN (free IPinfo Lite download token)
 # App registration credentials are picked up one-time from Taniwha.
-# Required app permissions (READ-ONLY, Application):
-#   AuditLog.Read.All
-#   (For UAL via Purview also: compliance.microsoft.com access)
+# Required app permissions / roles (READ-ONLY):
+#   Exchange.ManageAsApp (Office 365 Exchange Online, application) + Entra role "Global Reader"
+#   (or Exchange role group "View-Only Organization Management") and "View-Only Audit Logs" for Search-UnifiedAuditLog.
+#   Optional: Purview "eDiscovery Manager" (read) for Get-ComplianceSearch – without it: "nicht bewertet".
 #
-# Lookback window: configurable via input (default: 30 days, max: 180)
-# Windows that hit the 50,000-record ReturnLargeSet cap are split (daily, then halved down to 1 h);
-# windows still at the cap are reported to Taniwha as "unvollständig" instead of being silently cut.
+# Lookback: default 180 days (Audit Standard retention). Windows at the 50,000-record ReturnLargeSet cap are split
+# (daily, then halved down to 1 h); windows still at the cap are reported as "unvollständig".
+# Data minimisation: sign-ins (UserLoggedIn/UserLoginFailed) are pre-aggregated per user × IP; raw sign-ins only for
+# the last 30 days; other record types only for operations Taniwha evaluates.
+#
+# Offline IP enrichment (no customer IPs are sent to third parties):
+#   - IPinfo Lite (ASN, AS name, country, continent) – CC BY-SA 4.0, attribution "IP address data powered by IPinfo"
+#   - X4BNet/lists_vpn (datacenter + VPN ranges) – MIT (per README; upstream IPLocate data CC BY-SA 4.0)
+#   - Tor bulk exit list (check.torproject.org/torbulkexitlist) – public Tor Project data
+#   Source, licence and version are sent to Taniwha as enrichment_meta.
+#
 # Note: the Office 365 Management Activity API only reaches ~7 days back and is not suitable for assessments.
 name: M365 UAL Collection
 run-name: M365-UAL ${{ inputs.scan_id }}
@@ -22,8 +31,15 @@ on:
       callback_url:   { required: true }   # https://<platform>/api/public/m365-ual
       lookback_days:
         required: false
-        default: "30"
+        default: "180"
         description: "Wie viele Tage zurück (max 180)"
+      exchange_state:
+        required: false
+        default: "true"
+        description: "Exchange-Ist-Zustand sammeln (Get-* only)"
+      max_mailboxes:
+        required: false
+        default: "5000"
 
 concurrency:
   group: m365-ual
@@ -32,259 +48,423 @@ concurrency:
 jobs:
   collect-ual:
     runs-on: self-hosted
-    timeout-minutes: 120
+    # Self-hosted runner: no GitHub 6 h limit, but an explicit ceiling. The collector itself stops at
+    # BUDGET_MINUTES and reports the remaining work as "unvollständig".
+    timeout-minutes: 600
     env:
-      SCAN_ID:       ${{ inputs.scan_id }}
-      CALLBACK:      ${{ inputs.callback_url }}
-      INGEST:        ${{ secrets.RUNNER_INGEST_SECRET }}
-      LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+      SCAN_ID:        ${{ inputs.scan_id }}
+      CALLBACK:       ${{ inputs.callback_url }}
+      INGEST:         ${{ secrets.RUNNER_INGEST_SECRET }}
+      IPINFO_TOKEN:   ${{ secrets.IPINFO_TOKEN }}
+      LOOKBACK_DAYS:  ${{ inputs.lookback_days }}
+      EXCHANGE_STATE: ${{ inputs.exchange_state }}
+      MAX_MAILBOXES:  ${{ inputs.max_mailboxes }}
+      BUDGET_MINUTES: "540"
 
     steps:
       - name: Validate inputs
         run: |
           [[ "$SCAN_ID" =~ ^[0-9a-f-]{36}$ ]] || { echo "ungültige scan_id"; exit 1; }
           [[ "$CALLBACK" =~ ^https://[a-zA-Z0-9./-]+$ ]] || { echo "ungültige callback_url"; exit 1; }
-          [[ "$LOOKBACK_DAYS" =~ ^[0-9]+$ && "$LOOKBACK_DAYS" -le 180 ]] || LOOKBACK_DAYS=30
+          [[ "$LOOKBACK_DAYS" =~ ^[0-9]+$ && "$LOOKBACK_DAYS" -le 180 && "$LOOKBACK_DAYS" -ge 1 ]] || LOOKBACK_DAYS=180
+          [[ "$MAX_MAILBOXES" =~ ^[0-9]+$ && "$MAX_MAILBOXES" -le 50000 ]] || MAX_MAILBOXES=5000
           echo "LOOKBACK_DAYS=$LOOKBACK_DAYS" >> "$GITHUB_ENV"
+          echo "MAX_MAILBOXES=$MAX_MAILBOXES" >> "$GITHUB_ENV"
+          echo "STARTED_AT=$(date -u +%s)" >> "$GITHUB_ENV"
 
       - name: Pick up credentials from Taniwha
         run: |
           WORK=$(mktemp -d); chmod 700 "$WORK"
           echo "WORK=$WORK" >> "$GITHUB_ENV"
+          post() { curl -sS -m 30 -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" -d "$1" >/dev/null || true; }
 
-          post() { curl -sS -m 30 -X POST "$CALLBACK" \
-            -H "Authorization: Bearer $INGEST" \
-            -H "Content-Type: application/json" \
-            -d "$1" >/dev/null || true; }
-
-          curl -sS -m 30 --fail \
-            -X POST "$CALLBACK" \
-            -H "Authorization: Bearer $INGEST" \
-            -H "Content-Type: application/json" \
-            -d "{\"scan_id\":\"$SCAN_ID\",\"action\":\"pickup\"}" \
-            -o "$WORK/creds.json" || {
-              post "$(jq -nc --arg s "$SCAN_ID" \
-                '{scan_id:$s,status:"failed",note:"Zugangsdaten nicht abholbar."}')"
+          curl -sS -m 30 --fail -X POST "$CALLBACK" \
+            -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" \
+            -d "{\"scan_id\":\"$SCAN_ID\",\"action\":\"pickup\"}" -o "$WORK/creds.json" || {
+              post "$(jq -nc --arg s "$SCAN_ID" '{scan_id:$s,status:"failed",note:"Zugangsdaten nicht abholbar."}')"
               exit 1
             }
-
-          CLIENT_ID=$(jq -r .client_id     "$WORK/creds.json")
-          TENANT_ID=$(jq -r .tenant_id     "$WORK/creds.json")
+          CLIENT_ID=$(jq -r .client_id "$WORK/creds.json")
+          TENANT_ID=$(jq -r .tenant_id "$WORK/creds.json")
           TENANT_DOMAIN=$(jq -r .tenant_domain "$WORK/creds.json")
-          CERT_PW=$(jq -r .cert_pw         "$WORK/creds.json")
-
+          CERT_PW=$(jq -r .cert_pw "$WORK/creds.json")
           [ -n "$CERT_PW" ] && echo "::add-mask::$CERT_PW"
-
           jq -r .cert_b64 "$WORK/creds.json" | base64 -d > "$WORK/app.pfx"
           chmod 600 "$WORK/app.pfx"
           rm -f "$WORK/creds.json"
-
-          echo "CLIENT_ID=$CLIENT_ID"           >> "$GITHUB_ENV"
-          echo "TENANT_ID=$TENANT_ID"           >> "$GITHUB_ENV"
-          echo "TENANT_DOMAIN=$TENANT_DOMAIN"   >> "$GITHUB_ENV"
-          echo "CERT_PW=$CERT_PW"               >> "$GITHUB_ENV"
-
+          {
+            echo "CLIENT_ID=$CLIENT_ID"; echo "TENANT_ID=$TENANT_ID"
+            echo "TENANT_DOMAIN=$TENANT_DOMAIN"; echo "CERT_PW=$CERT_PW"
+          } >> "$GITHUB_ENV"
           [[ "$TENANT_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
             post "$(jq -nc --arg s "$SCAN_ID" '{scan_id:$s,status:"failed",note:"Ungültige Tenant-ID."}')"
             exit 1
           }
+          post "$(jq -nc --arg s "$SCAN_ID" --arg d "$LOOKBACK_DAYS" '{scan_id:$s,status:"running",note:("Sammlung gestartet: Audit-Log "+$d+" Tage + Exchange-Zustand")}')"
 
-          post "$(jq -nc --arg s "$SCAN_ID" --arg d "$LOOKBACK_DAYS" \
-            '{scan_id:$s,status:"running",note:("UAL-Sammlung gestartet, Zeitfenster: "+$d+" Tage")}')"
-
-      - name: Collect UAL via PowerShell (Exchange Online / Purview)
+      - name: Download offline IP databases
         run: |
-          post() { curl -sS -m 30 -X POST "$CALLBACK" \
-            -H "Authorization: Bearer $INGEST" \
-            -H "Content-Type: application/json" \
-            -d "$1" >/dev/null || true; }
+          mkdir -p "$WORK/ipdb"
+          META="$WORK/ipdb/meta.json"; echo '[]' > "$META"
+          addmeta() { jq --arg n "$1" --arg s "$2" --arg l "$3" --arg v "$4" '. + [{name:$n,source:$s,license:$l,version:$v}]' "$META" > "$META.tmp" && mv "$META.tmp" "$META"; }
+          if [ -n "$IPINFO_TOKEN" ]; then
+            if curl -sSfL -m 300 -D "$WORK/ipdb/ipinfo.h" "https://ipinfo.io/data/ipinfo_lite.mmdb?token=$IPINFO_TOKEN" -o "$WORK/ipdb/ipinfo_lite.mmdb"; then
+              V=$(grep -i '^last-modified:' "$WORK/ipdb/ipinfo.h" | cut -d' ' -f2- | tr -d '\r'); V=${V:-$(date -u +%F)}
+              addmeta "IPinfo Lite" "https://ipinfo.io/lite" "CC BY-SA 4.0 – IP address data powered by IPinfo" "$V"
+            fi
+            rm -f "$WORK/ipdb/ipinfo.h"
+          fi
+          for kind in datacenter vpn; do
+            curl -sSfL -m 120 "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/$kind/ipv4.txt" -o "$WORK/ipdb/x4b-$kind.txt" || true
+            curl -sSfL -m 120 "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/$kind/ipv6.txt" -o "$WORK/ipdb/x4b-$kind-v6.txt" || true
+          done
+          SHA=$(curl -sS -m 30 https://api.github.com/repos/X4BNet/lists_vpn/commits/main | jq -r '.sha // empty' | cut -c1-12)
+          [ -s "$WORK/ipdb/x4b-vpn.txt" ] && addmeta "X4BNet lists_vpn" "https://github.com/X4BNet/lists_vpn" "MIT (README); Upstream IPLocate CC BY-SA 4.0" "${SHA:-$(date -u +%F)}"
+          if curl -sSfL -m 60 https://check.torproject.org/torbulkexitlist -o "$WORK/ipdb/tor.txt"; then
+            addmeta "Tor Exit-Liste" "https://check.torproject.org/torbulkexitlist" "Öffentliche Tor-Project-Daten" "$(date -u +%FT%TZ)"
+          fi
+          cat "$META"
 
-          cat > "$WORK/collect-ual.ps1" <<'PS'
+      - name: Collect UAL and Exchange state via PowerShell (read-only)
+        run: |
+          post() { curl -sS -m 30 -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" -d "$1" >/dev/null || true; }
+          cat > "$WORK/collect.ps1" <<'PS'
           $ErrorActionPreference = 'Stop'
           Set-PSRepository PSGallery -InstallationPolicy Trusted
+          if (-not (Get-Module -ListAvailable ExchangeOnlineManagement)) { Install-Module ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber | Out-Null }
+          Import-Module ExchangeOnlineManagement
+          $pw   = if ($env:CERT_PW) { ConvertTo-SecureString $env:CERT_PW -AsPlainText -Force } else { New-Object System.Security.SecureString }
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('/w/app.pfx', $pw, 'Exportable')
+          Connect-ExchangeOnline -AppId $env:CLIENT_ID -Certificate $cert -Organization $env:TENANT_DOMAIN -ShowBanner:$false
 
-          # Module installieren
-          foreach ($m in 'ExchangeOnlineManagement','Microsoft.Graph.Authentication') {
-            if (-not (Get-Module -ListAvailable $m)) {
-              Install-Module $m -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck | Out-Null
-            }
-          }
-          Import-Module ExchangeOnlineManagement, Microsoft.Graph.Authentication
-
-          # Zertifikat laden
-          $pw   = if ($env:CERT_PW) { ConvertTo-SecureString $env:CERT_PW -AsPlainText -Force } `
-                  else { New-Object System.Security.SecureString }
-          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-            '/w/app.pfx', $pw, 'Exportable')
-
-          # Verbinden
-          Connect-ExchangeOnline -AppId $env:CLIENT_ID -Certificate $cert `
-            -Organization $env:TENANT_DOMAIN -ShowBanner:$false
-          Connect-MgGraph -ClientId $env:CLIENT_ID -TenantId $env:TENANT_ID `
-            -Certificate $cert -NoWelcome
-
+          $deadline = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:STARTED_AT).UtcDateTime.AddMinutes([int]$env:BUDGET_MINUTES)
+          function Over-Budget { return (Get-Date).ToUniversalTime() -gt $deadline }
           $lookback = [int]$env:LOOKBACK_DAYS
-          $start    = (Get-Date).AddDays(-$lookback).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-          $end      = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $startDt  = (Get-Date).ToUniversalTime().AddDays(-$lookback)
+          $endDt    = (Get-Date).ToUniversalTime()
+          New-Item -ItemType Directory -Force -Path /w/exchange | Out-Null
 
-          # UAL-Record-Typen die Taniwha auswertet
-          $recordTypes = @(
-            'ExchangeAdmin',        # Set-InboxRule, Set-Mailbox, etc.
-            'ExchangeItem',         # HardDelete, MoveToDeletedItems
-            'SharePoint',           # FileDownloaded, FileDeleted
-            'SharePointFileOperation',
-            'ExchangeItemAggregated', # MailItemsAccessed
-            'AzureActiveDirectory', # Entra ID Änderungen
-            'AzureActiveDirectoryStsLogon',
-            'MicrosoftTeams',       # TeamsMessage, MeetingParticipantDetail
-            'SecurityComplianceCenter',
-            'OneDrive'
-          )
-
-          $allEvents  = [System.Collections.Generic.List[PSObject]]::new()
+          # ---------------- Unified Audit Log ----------------
+          $recordTypes = @('AzureActiveDirectoryStsLogon','AzureActiveDirectory','ExchangeAdmin','ExchangeItem','ExchangeItemAggregated',
+                           'SharePointFileOperation','SharePointSharingOperation','Discovery','MicrosoftTeams','SecurityComplianceCenter','SharePoint','OneDrive')
+          $outFile = [System.IO.StreamWriter]::new('/w/ual-events.ndjson', $false, [System.Text.UTF8Encoding]::new($false))
           $incomplete = [System.Collections.Generic.List[PSObject]]::new()
-          $cap        = 50000     # ReturnLargeSet: max. 50.000 Einträge pro Session
-          $minSpan    = [TimeSpan]::FromHours(1)
-
-          function Add-Results($results) {
+          $cap = 50000; $minSpan = [TimeSpan]::FromHours(1)
+          $script:count = 0
+          function Write-Results($results) {
             foreach ($r in $results) {
-              $auditData = $null
-              try { $auditData = $r.AuditData | ConvertFrom-Json } catch {}
-              $allEvents.Add([PSCustomObject]@{
-                record_type  = "$($r.RecordType)"
-                operation    = $r.Operations
-                user_id      = $r.UserIds
-                user_key     = $auditData?.UserId ?? $r.UserIds
-                workload     = $auditData?.Workload
-                client_ip    = $auditData?.ClientIP ?? $auditData?.ActorIpAddress
-                object_id    = $auditData?.ObjectId ?? $auditData?.TargetObjectId
-                occurred_at  = $r.CreationDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-                raw          = $r.AuditData
-              })
+              $outFile.WriteLine((@{ record_type = "$($r.RecordType)"; operation = $r.Operations; user_id = $r.UserIds;
+                occurred_at = $r.CreationDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"); raw = $r.AuditData } | ConvertTo-Json -Compress -Depth 3))
+              $script:count++
             }
           }
-
-          # Liest ein Zeitfenster vollständig. Erreicht die Session die 50.000er-Grenze, wird das Fenster
-          # aufgeteilt (erst tageweise, dann halbiert bis 1 h) statt still abzuschneiden. Bleibt es voll -> "unvollständig".
           function Read-Window([string]$rt, [datetime]$from, [datetime]$to) {
+            if (Over-Budget) { $incomplete.Add([PSCustomObject]@{ start = $from.ToString("o"); end = $to.ToString("o"); record_type = "$rt (Zeitbudget)" }); return }
             $session = "$rt-$env:SCAN_ID-$($from.Ticks)"
             $buffer  = [System.Collections.Generic.List[PSObject]]::new()
             do {
-              $results = Search-UnifiedAuditLog -StartDate $from -EndDate $to -RecordType $rt `
-                -ResultSize 5000 -SessionId $session -SessionCommand ReturnLargeSet
+              $results = Search-UnifiedAuditLog -StartDate $from -EndDate $to -RecordType $rt -ResultSize 5000 -SessionId $session -SessionCommand ReturnLargeSet
               if ($results) { $buffer.AddRange([PSObject[]]$results) }
             } while ($results -and $results.Count -eq 5000 -and $buffer.Count -lt $cap)
-            if ($buffer.Count -lt $cap) { Add-Results $buffer; Write-Host "  ${rt} $($from.ToString('u'))–$($to.ToString('u')): $($buffer.Count)"; return }
+            if ($buffer.Count -lt $cap) { Write-Results $buffer; return }
             $span = $to - $from
-            if ($span -le $minSpan) {
-              Add-Results $buffer
-              $incomplete.Add([PSCustomObject]@{ start = $from.ToString("yyyy-MM-ddTHH:mm:ssZ"); end = $to.ToString("yyyy-MM-ddTHH:mm:ssZ"); record_type = $rt })
-              Write-Warning "${rt}: Fenster $($from.ToString('u')) trotz Aufteilung an der Grenze – unvollständig"
-              return
-            }
+            if ($span -le $minSpan) { Write-Results $buffer; $incomplete.Add([PSCustomObject]@{ start = $from.ToString("o"); end = $to.ToString("o"); record_type = $rt }); return }
             $step = if ($span.TotalDays -gt 1) { [TimeSpan]::FromDays(1) } else { [TimeSpan]::FromTicks([Math]::Max($minSpan.Ticks, [long]($span.Ticks / 2))) }
-            for ($t = $from; $t -lt $to; $t = $t + $step) {
-              $e = if (($t + $step) -lt $to) { $t + $step } else { $to }
-              Read-Window $rt $t $e
-            }
+            for ($t = $from; $t -lt $to; $t = $t + $step) { $e = if (($t + $step) -lt $to) { $t + $step } else { $to }; Read-Window $rt $t $e }
           }
-
-          $startDt = [datetime]::Parse($start).ToUniversalTime()
-          $endDt   = [datetime]::Parse($end).ToUniversalTime()
           foreach ($rt in $recordTypes) {
-            try { Write-Host "Sammle: $rt ..."; Read-Window $rt $startDt $endDt }
-            catch { Write-Warning "${rt}: $($_.Exception.Message)"; $incomplete.Add([PSCustomObject]@{ start = $start; end = $end; record_type = $rt }) }
+            try { Write-Host "UAL: $rt"; Read-Window $rt $startDt $endDt }
+            catch { Write-Warning "${rt}: $($_.Exception.Message)"; $incomplete.Add([PSCustomObject]@{ start = $startDt.ToString("o"); end = $endDt.ToString("o"); record_type = $rt }) }
           }
+          $outFile.Close()
+          ConvertTo-Json -InputObject @{ start = $startDt.ToString("o"); end = $endDt.ToString("o"); incomplete = @($incomplete); events = $script:count } -Depth 4 -Compress | Set-Content /w/ual-meta.json -Encoding UTF8
+          Write-Host "UAL gesamt: $script:count"
 
-          Write-Host "Gesamt: $($allEvents.Count) UAL-Events, unvollständige Fenster: $($incomplete.Count)"
-          ConvertTo-Json -InputObject @($allEvents) -Depth 5 -Compress | Set-Content /w/ual-events.json -Encoding UTF8
-          ConvertTo-Json -InputObject @{ start = $start; end = $end; incomplete = @($incomplete) } -Depth 4 -Compress | Set-Content /w/ual-meta.json -Encoding UTF8
-          Write-Host "Fertig."
+          # ---------------- Exchange state (Get-* only) ----------------
+          if ($env:EXCHANGE_STATE -ne 'true') { return }
+          function Save($kind, $data, [bool]$inc = $false, [string]$note = '') {
+            @{ kind = $kind; incomplete = $inc; note = $note; data = @($data) } | ConvertTo-Json -Depth 6 -Compress | Set-Content "/w/exchange/$kind.json" -Encoding UTF8
+          }
+          function SaveObj($kind, $obj) { @{ kind = $kind; incomplete = $false; note = ''; data = $obj } | ConvertTo-Json -Depth 6 -Compress | Set-Content "/w/exchange/$kind.json" -Encoding UTF8 }
+          function Try-Run([string]$kind, [scriptblock]$sb) { try { & $sb } catch { Write-Warning "${kind}: $($_.Exception.Message)"; Save $kind @() $true "nicht bewertet: $($_.Exception.Message -replace '\s+',' ')" } }
+
+          $accepted = @()
+          Try-Run 'accepted_domains' { $script:accepted = @(Get-AcceptedDomain | ForEach-Object { "$($_.DomainName)".ToLower() }); Save 'accepted_domains' ($script:accepted | ForEach-Object { @{ domainName = $_ } }) }
+          Try-Run 'audit_config' {
+            $a = Get-AdminAuditLogConfig; $o = Get-OrganizationConfig
+            SaveObj 'audit_config' @{ unifiedAuditLogIngestionEnabled = $a.UnifiedAuditLogIngestionEnabled; auditDisabled = $o.AuditDisabled }
+          }
+          Try-Run 'audit_bypass' { Save 'audit_bypass' (Get-MailboxAuditBypassAssociation -ResultSize Unlimited | Where-Object AuditBypassEnabled | ForEach-Object { @{ name = "$($_.Name)"; auditBypassEnabled = $true } }) }
+
+          $max = [int]$env:MAX_MAILBOXES
+          $mbx = @(); $mbxCapped = $false
+          Try-Run 'mailboxes' {
+            $all = @(Get-EXOMailbox -ResultSize ($max + 1) -PropertySets Minimum,Delivery,Audit -Properties GrantSendOnBehalfTo,DistinguishedName,DisplayName,Name,Alias,Identity,ExternalDirectoryObjectId,PrimarySmtpAddress)
+            if ($all.Count -gt $max) { $script:mbxCapped = $true; $all = $all[0..($max-1)] }
+            $script:mbx = $all
+            Save 'mailboxes' ($all | ForEach-Object { @{ upn = "$($_.UserPrincipalName)".ToLower(); forwardingSmtpAddress = "$($_.ForwardingSmtpAddress)"; forwardingAddress = "$($_.ForwardingAddress)";
+              deliverToMailboxAndForward = $_.DeliverToMailboxAndForward; auditEnabled = $_.AuditEnabled; grantSendOnBehalfTo = @($_.GrantSendOnBehalfTo | ForEach-Object { "$_" }) } }) $script:mbxCapped ($(if ($script:mbxCapped) { "Obergrenze $max Postfächer erreicht" } else { '' }))
+          }
+          # Lookup: any mailbox/recipient identifier → UPN (entities are always normalised to UPN for correlation).
+          $upnOf = @{}; $dnOf = @{}; $dispCount = @{}
+          function Add-Key($k, $upn) { $k = "$k".Trim().ToLower(); if ($k -and -not $upnOf.ContainsKey($k)) { $upnOf[$k] = $upn } }
+          foreach ($m in $mbx) { $dispCount["$($m.DisplayName)".ToLower()] = 1 + [int]$dispCount["$($m.DisplayName)".ToLower()] }
+          foreach ($m in $mbx) {
+            $u = "$($m.UserPrincipalName)".ToLower()
+            foreach ($k in @($m.UserPrincipalName, $m.PrimarySmtpAddress, $m.Name, $m.Alias, $m.Identity, $m.DistinguishedName, $m.ExternalDirectoryObjectId)) { Add-Key $k $u }
+            if ($dispCount["$($m.DisplayName)".ToLower()] -eq 1) { Add-Key $m.DisplayName $u }
+            if ($m.DistinguishedName) { $dnOf["$($m.DistinguishedName)".ToLower()] = $u }
+          }
+          try {
+            $recDisp = @{}; $recs = @(Get-EXORecipient -ResultSize 50000 -Properties DisplayName,Name,Alias,PrimarySmtpAddress,ExternalDirectoryObjectId,Identity)
+            foreach ($r in $recs) { $recDisp["$($r.DisplayName)".ToLower()] = 1 + [int]$recDisp["$($r.DisplayName)".ToLower()] }
+            foreach ($r in $recs) { $id = "$($r.PrimarySmtpAddress)".ToLower(); if (-not $id) { continue }
+              foreach ($k in @($r.Name, $r.Alias, $r.Identity, $r.ExternalDirectoryObjectId, $r.PrimarySmtpAddress)) { Add-Key $k $id }
+              if ($recDisp["$($r.DisplayName)".ToLower()] -eq 1) { Add-Key $r.DisplayName $id } }
+          } catch { Write-Warning "Empfänger-Lookup: $($_.Exception.Message)" }
+          function To-Upn($v) { $k = "$v".Trim().ToLower(); if ($upnOf.ContainsKey($k)) { return $upnOf[$k] }; if ($k -match '@') { return $k }; return '' }
+          $rules = [System.Collections.Generic.List[object]]::new(); $fold = [System.Collections.Generic.List[object]]::new(); $partial = $script:mbxCapped
+          foreach ($m in $mbx) {
+            if (Over-Budget) { $partial = $true; break }
+            $upn = "$($m.UserPrincipalName)".ToLower()
+            try {
+              foreach ($r in @(Get-InboxRule -Mailbox $m.ExternalDirectoryObjectId -IncludeHidden -WarningAction SilentlyContinue)) {
+                $rules.Add(@{ mailbox = $upn; name = "$($r.Name)"; enabled = $r.Enabled; forwardTo = @($r.ForwardTo | % { "$_" }); redirectTo = @($r.RedirectTo | % { "$_" }); forwardAsAttachmentTo = @($r.ForwardAsAttachmentTo | % { "$_" });
+                  deleteMessage = $r.DeleteMessage; markAsRead = $r.MarkAsRead; moveToFolder = "$($r.MoveToFolder)"; subjectContainsWords = @($r.SubjectContainsWords); bodyContainsWords = @($r.BodyContainsWords);
+                  subjectOrBodyContainsWords = @($r.SubjectOrBodyContainsWords); from = @($r.From | % { "$_" }) })
+              }
+              foreach ($f in @('Inbox','Calendar')) {
+                foreach ($p in @(Get-EXOMailboxFolderPermission -Identity "$($upn):\$f" -ErrorAction SilentlyContinue)) {
+                  $u = "$($p.User)"; if ($u -match '^(Default|Anonymous|Standard|Anonym)$') { $fold.Add(@{ mailbox = $upn; folder = $f; user = $u; accessRights = @($p.AccessRights | % { "$_" }) }) }
+                }
+              }
+            } catch { $partial = $true }
+          }
+          Save 'inbox_rules' $rules $partial ($(if ($partial) { 'Obergrenze oder Zeitbudget erreicht – nicht alle Postfächer geprüft' } else { '' }))
+          Save 'folder_permissions' $fold $partial
+          Try-Run 'remote_domains' { Save 'remote_domains' (Get-RemoteDomain | ForEach-Object { @{ domainName = "$($_.DomainName)"; autoForwardEnabled = $_.AutoForwardEnabled } }) }
+          Try-Run 'outbound_spam' { Save 'outbound_spam' (Get-HostedOutboundSpamFilterPolicy | ForEach-Object { @{ name = "$($_.Name)"; autoForwardingMode = "$($_.AutoForwardingMode)" } }) }
+          Try-Run 'transport_rules' { Save 'transport_rules' (Get-TransportRule -ResultSize Unlimited | ForEach-Object { @{ name = "$($_.Name)"; state = "$($_.State)"; blindCopyTo = @($_.BlindCopyTo | % { "$_" }); redirectMessageTo = @($_.RedirectMessageTo | % { "$_" }); copyTo = @($_.CopyTo | % { "$_" }); addToRecipients = @($_.AddToRecipients | % { "$_" }); setSCL = "$($_.SetSCL)"; fromScope = "$($_.FromScope)"; removeHeader = "$($_.RemoveHeader)"; whenChanged = $_.WhenChanged.ToUniversalTime().ToString("o") } }) }
+          Try-Run 'connectors' {
+            $c = @(Get-InboundConnector | % { @{ name = "$($_.Name)"; direction = 'Inbound'; enabled = $_.Enabled; senderDomains = @($_.SenderDomains | % { "$_" }); whenCreated = $_.WhenCreated.ToUniversalTime().ToString("o") } })
+            $c += @(Get-OutboundConnector | % { @{ name = "$($_.Name)"; direction = 'Outbound'; enabled = $_.Enabled; smartHosts = @($_.SmartHosts | % { "$_" }); recipientDomains = @($_.RecipientDomains | % { "$_" }); whenCreated = $_.WhenCreated.ToUniversalTime().ToString("o") } })
+            Save 'connectors' $c
+          }
+          Try-Run 'mailbox_permissions' { Save 'mailbox_permissions' ($mbx | ForEach-Object { $id = $_.UserPrincipalName; Get-EXOMailboxPermission -Identity $id -ErrorAction SilentlyContinue | Where-Object { -not $_.IsInherited -and "$($_.User)" -notmatch '^NT AUTHORITY\\SELF$' -and "$($_.AccessRights)" -match 'FullAccess' } | ForEach-Object { @{ mailbox = "$id".ToLower(); user = "$($_.User)"; accessRights = @($_.AccessRights | % { "$_" }); isInherited = $false } } }) $mbxCapped }
+          Try-Run 'recipient_permissions' { Save 'recipient_permissions' (Get-EXORecipientPermission -ResultSize Unlimited | Where-Object { "$($_.Trustee)" -notmatch '^NT AUTHORITY\\SELF$' -and "$($_.AccessRights)" -match 'SendAs' } | ForEach-Object { @{ mailbox = "$($_.Identity)".ToLower(); mailboxUpn = (To-Upn $_.Identity); trustee = "$($_.Trustee)"; trusteeUpn = (To-Upn $_.Trustee); accessRights = @($_.AccessRights | % { "$_" }) } }) }
+          # Get-MobileDevice only exposes the display name: map via the parent mailbox DN, then the Identity prefix, then a unique display name.
+          Try-Run 'mobile_devices' { Save 'mobile_devices' (Get-MobileDevice -ResultSize Unlimited | ForEach-Object {
+            $dn = "$($_.DistinguishedName)".ToLower(); $parent = ($dn -split '(?<!\\),', 3)[2]
+            $upn = if ($parent -and $dnOf.ContainsKey($parent)) { $dnOf[$parent] } else { To-Upn ("$($_.Identity)" -split '\\')[0] }
+            if (-not $upn) { $upn = To-Upn $_.UserDisplayName }
+            @{ mailbox = $(if ($upn) { $upn } else { "$($_.UserDisplayName)" }); upn = $upn; mailboxDisplayName = "$($_.UserDisplayName)"; deviceId = "$($_.DeviceId)"; deviceModel = "$($_.DeviceModel)"; deviceOS = "$($_.DeviceOS)"; deviceUserAgent = "$($_.DeviceUserAgent)"; firstSyncTime = if ($_.FirstSyncTime) { $_.FirstSyncTime.ToUniversalTime().ToString("o") } else { $null } } }) }
+
+          # Message trace (10 days), aggregated per sender × hour – no message contents leave the runner.
+          Try-Run 'message_trace' {
+            $agg = @{}; $msgs = 0; $trInc = $false
+            $end = (Get-Date).ToUniversalTime(); $start = $end.AddDays(-10)
+            $useV2 = [bool](Get-Command Get-MessageTraceV2 -ErrorAction SilentlyContinue)
+            $page = 1; $cursorEnd = $end
+            while ($true) {
+              if (Over-Budget -or $msgs -ge 500000) { $trInc = $true; break }
+              $batch = if ($useV2) { @(Get-MessageTraceV2 -StartDate $start -EndDate $cursorEnd -ResultSize 5000) } else { @(Get-MessageTrace -StartDate $start -EndDate $end -PageSize 5000 -Page $page) }
+              foreach ($m in $batch) {
+                $sender = "$($m.SenderAddress)".ToLower(); if (-not $sender) { continue }
+                $hour = $m.Received.ToUniversalTime().ToString("yyyy-MM-ddTHH:00:00Z"); $key = "$sender|$hour"
+                if (-not $agg.ContainsKey($key)) { $agg[$key] = @{ sender = $sender; hour = $hour; messages = 0; rcpt = @{}; ext = 0; subj = @{} } }
+                $a = $agg[$key]; $a.messages++; $r = "$($m.RecipientAddress)".ToLower(); $a.rcpt[$r] = 1
+                if ($accepted.Count -and -not ($accepted -contains ($r -split '@')[-1])) { $a.ext++ }
+                $s = "$($m.Subject)"; $a.subj[$s] = 1 + [int]$a.subj[$s]
+              }
+              $msgs += $batch.Count
+              if ($batch.Count -lt 5000) { break }
+              if ($useV2) { $cursorEnd = ($batch | Sort-Object Received | Select-Object -First 1).Received } else { $page++; if ($page -gt 1000) { $trInc = $true; break } }
+            }
+            $rows = foreach ($a in $agg.Values) { $top = $a.subj.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1
+              @{ sender = $a.sender; hour = $a.hour; messages = $a.messages; recipients = $a.rcpt.Count; externalRecipients = $a.ext; distinctSubjects = $a.subj.Count; maxSameSubject = [int]$top.Value; topSubject = "$($top.Name)".Substring(0, [Math]::Min(120, "$($top.Name)".Length)) } }
+            Save 'message_trace' @($rows) $trInc
+          }
+          # Optional (Purview): without permission → "nicht bewertet".
+          Try-Run 'compliance_searches' {
+            Connect-IPPSSession -AppId $env:CLIENT_ID -Certificate $cert -Organization $env:TENANT_DOMAIN -ShowBanner:$false
+            Save 'compliance_searches' (Get-ComplianceSearch | ForEach-Object { @{ name = "$($_.Name)"; createdBy = "$($_.CreatedBy)"; createdTime = $_.CreatedTime.ToUniversalTime().ToString("o"); status = "$($_.Status)" } })
+          }
+          Write-Host "Exchange-Zustand gesammelt."
           PS
 
-          docker run --rm \
-            --name "taniwha-ual-$SCAN_ID" \
-            -v "$WORK:/w" \
-            -e CLIENT_ID \
-            -e TENANT_ID \
-            -e TENANT_DOMAIN \
-            -e CERT_PW \
-            -e SCAN_ID \
-            -e LOOKBACK_DAYS \
-            mcr.microsoft.com/powershell:lts-ubuntu-22.04 \
-            pwsh -NoProfile -File /w/collect-ual.ps1 \
-            2>&1 | tail -n 200 | tee "$RUNNER_TEMP/ual.log" || true
+          timeout --signal=TERM "$((BUDGET_MINUTES + 20))m" docker run --rm --name "taniwha-ual-$SCAN_ID" -v "$WORK:/w" \
+            -e CLIENT_ID -e TENANT_ID -e TENANT_DOMAIN -e CERT_PW -e SCAN_ID -e LOOKBACK_DAYS -e EXCHANGE_STATE -e MAX_MAILBOXES -e STARTED_AT -e BUDGET_MINUTES \
+            mcr.microsoft.com/powershell:lts-ubuntu-22.04 pwsh -NoProfile -File /w/collect.ps1 2>&1 | tail -n 300 | tee "$RUNNER_TEMP/ual.log" || true
 
-          if [ ! -s "$WORK/ual-events.json" ]; then
+          if [ ! -s "$WORK/ual-meta.json" ]; then
             NOTE=$(tail -c 1000 "$RUNNER_TEMP/ual.log" | grep -viE 'secret|password|cert' || true)
-            post "$(jq -nc --arg s "$SCAN_ID" --arg n "UAL-Sammlung fehlgeschlagen: $NOTE" \
-              '{scan_id:$s,status:"failed",note:$n}')"
+            post "$(jq -nc --arg s "$SCAN_ID" --arg n "Sammlung fehlgeschlagen: $NOTE" '{scan_id:$s,status:"failed",note:$n}')"
             exit 1
           fi
+          post "$(jq -nc --arg s "$SCAN_ID" --arg n "$(jq -r .events "$WORK/ual-meta.json") UAL-Events gesammelt, Anreicherung und Übertragung …" '{scan_id:$s,status:"running",note:$n}')"
 
-          EVENT_COUNT=$(jq 'length' "$WORK/ual-events.json" 2>/dev/null || echo "?")
-          post "$(jq -nc --arg s "$SCAN_ID" --arg n "$EVENT_COUNT UAL-Events gesammelt, übertrage an Taniwha" \
-            '{scan_id:$s,status:"running",note:$n}')"
-
-      - name: Send UAL events to Taniwha (chunked)
+      - name: Enrich offline, aggregate sign-ins and send to Taniwha
         run: |
-          post() { curl -sS -m 30 -X POST "$CALLBACK" \
-            -H "Authorization: Bearer $INGEST" \
-            -H "Content-Type: application/json" \
-            -d "$1" >/dev/null || true; }
+          pip install --quiet --user maxminddb >/dev/null 2>&1 || true
+          python3 - "$WORK" "$SCAN_ID" "$CALLBACK" "$INGEST" <<'PY'
+          import json, sys, os, glob, ipaddress, urllib.request, datetime, re
+          work, scan_id, callback, secret = sys.argv[1:5]
+          def send(payload):
+              req = urllib.request.Request(callback, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json", "Authorization": f"Bearer {secret}"})
+              with urllib.request.urlopen(req, timeout=180): pass
 
-          # In 500er-Chunks senden damit der Payload nicht zu groß wird
-          python3 - "$WORK/ual-events.json" "$SCAN_ID" "$CALLBACK" "$INGEST" "$WORK/ual-meta.json" <<'PY'
-          import json, sys, urllib.request, math
-
-          events_file, scan_id, callback, secret, meta_file = sys.argv[1:6]
-          with open(meta_file, encoding="utf-8") as f:
-              meta = json.load(f)
-
-          with open(events_file, encoding="utf-8") as f:
-              events = json.load(f)
-
-          if not isinstance(events, list):
-              events = [events]
-
-          chunk_size = 500
-          total      = len(events)
-          chunks     = math.ceil(total / chunk_size) if total else 1
-
-          print(f"Sende {total} Events in {chunks} Chunks", flush=True)
-
-          for i in range(chunks):
-              chunk   = events[i * chunk_size:(i + 1) * chunk_size]
-              payload = json.dumps({
-                  "scan_id":     scan_id,
-                  "status":      "done" if i == chunks - 1 else "partial",
-                  "source":      "ual",
-                  "chunk":       i + 1,
-                  "total_chunks": chunks,
-                  "events":      chunk,
-                  "window_start": meta.get("start"),
-                  "window_end":   meta.get("end"),
-                  "incomplete_windows": (meta.get("incomplete") or []) if i == chunks - 1 else [],
-              }).encode()
-
-              req = urllib.request.Request(
-                  callback,
-                  data=payload,
-                  headers={
-                      "Content-Type":  "application/json",
-                      "Authorization": f"Bearer {secret}",
-                  },
-              )
+          # ---- offline IP enrichment ----
+          mmdb = None
+          try:
+              import maxminddb
+              if os.path.exists(f"{work}/ipdb/ipinfo_lite.mmdb"): mmdb = maxminddb.open_database(f"{work}/ipdb/ipinfo_lite.mmdb")
+          except Exception as e: print("IPinfo Lite nicht verfügbar:", e)
+          def nets(path):
+              out = []
+              if os.path.exists(path):
+                  for line in open(path, encoding="utf-8"):
+                      line = line.strip()
+                      if line and not line.startswith("#"):
+                          try: out.append(ipaddress.ip_network(line, strict=False))
+                          except ValueError: pass
+              return out
+          # X4BNet lists_vpn: IPv4 and IPv6 (datacenter + vpn).
+          hosting = nets(f"{work}/ipdb/x4b-datacenter.txt") + nets(f"{work}/ipdb/x4b-datacenter-v6.txt")
+          vpn = nets(f"{work}/ipdb/x4b-vpn.txt") + nets(f"{work}/ipdb/x4b-vpn-v6.txt")
+          tor = set(l.strip() for l in open(f"{work}/ipdb/tor.txt")) if os.path.exists(f"{work}/ipdb/tor.txt") else set()
+          MOBILE = re.compile(r"mobile|wireless|cellular|vodafone|telefonica|o2 |t-mobile|orange|verizon wireless|at&t mobility|e-plus|1&1 mobil", re.I)
+          cache = {}
+          def enrich(ip):
+              if ip in cache: return cache[ip]
+              r = {"asn": None, "as_name": None, "country": None, "continent": None, "hosting": False, "vpn": False, "tor": ip in tor, "mobile": False}
               try:
-                  with urllib.request.urlopen(req, timeout=120):
-                      pass
-                  print(f"  Chunk {i+1}/{chunks} OK", flush=True)
-              except Exception as e:
-                  print(f"  Chunk {i+1}/{chunks} FEHLER: {e}", flush=True)
-                  sys.exit(1)
+                  a = ipaddress.ip_address(ip)
+                  if mmdb:
+                      d = mmdb.get(ip) or {}
+                      r.update(asn=d.get("asn"), as_name=d.get("as_name"), country=d.get("country_code"), continent=d.get("continent_code"))
+                  r["hosting"] = any(a.version == n.version and a in n for n in hosting)
+                  r["vpn"] = any(a.version == n.version and a in n for n in vpn)
+                  r["mobile"] = bool(r["as_name"] and MOBILE.search(r["as_name"]))
+              except ValueError: pass
+              cache[ip] = r
+              return r
+
+          RELEVANT = {"UserLoggedIn","UserLoginFailed","Set-InboxRule","New-InboxRule","UpdateInboxRules","Set-Mailbox","HardDelete","SoftDelete","MoveToDeletedItems","Send",
+            "SharingSet","AddedToSecureLink","FileSent","Consent to application.","Consent to application","New-TransportRule","Set-TransportRule","Add-MailboxPermission","Add-RecipientPermission",
+            "New-InboundConnector","New-OutboundConnector","New-ManagementRoleAssignment","Set-AdminAuditLogConfig","Set-OrganizationConfig","Set-MailboxAuditBypassAssociation",
+            "New-RetentionCompliancePolicy","Set-RetentionCompliancePolicy","Remove-RetentionCompliancePolicy","Set-RetentionComplianceRule","Remove-RetentionComplianceRule","Set-RetentionPolicy","Remove-RetentionPolicy",
+            "MailItemsAccessed","FileDownloaded","FileSyncDownloadedFull","User registered security info","User changed default security info","Update user.","Register device.","Add registered owner to device.","Add device.",
+            "Add member to role.","Invite external user.","Add user.","New-ComplianceSearch","Start-ComplianceSearch","New-ComplianceSearchAction","SearchCreated","SearchStarted","SearchExported","ViewedSearchExported","SearchExportDownloaded",
+            "Update application – Certificates and secrets management ","Add service principal credentials.","Set domain authentication.","Set federation settings on domain.","Add domain to company.","Verify domain."}
+          def norm(ip):
+              """IPv6 → /64 (privacy addresses/mobile rotate within the prefix); IPv4 unchanged."""
+              try:
+                  a = ipaddress.ip_address(ip)
+                  return str(ipaddress.ip_network(f"{ip}/64", strict=False)) if a.version == 6 else ip
+              except ValueError: return ip
+          def add_example(lst, ip):
+              if ip not in lst and len(lst) < 5: lst.append(ip)
+          def enrich_key(key, examples):
+              return enrich(examples[0] if "/" in key and examples else key)
+          TOOL_UA = re.compile(r"rclone|python|\bcurl\b|wget|powershell|go-http-client", re.I)
+          agg_mail, agg_dl = {}, {}
+          now = datetime.datetime.now(datetime.timezone.utc)
+          raw_cut = (now - datetime.timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+          def ua_family(ua):
+              if not ua: return "(leer)"
+              for k in ["BAV2ROPC","python","axios","rclone","curl","Go-http-client","Outlook","Teams","Edge","Chrome","Firefox","Safari","okhttp","Mozilla"]:
+                  if k.lower() in ua.lower(): return k
+              return ua[:30]
+          base = {}
+          events = []
+          for line in open(f"{work}/ual-events.ndjson", encoding="utf-8"):
+              try: e = json.loads(line)
+              except Exception: continue
+              op = e.get("operation") or ""
+              if op not in RELEVANT: continue
+              try: raw = json.loads(e["raw"]) if isinstance(e.get("raw"), str) else (e.get("raw") or {})
+              except Exception: raw = {}
+              ip = (raw.get("ClientIP") or raw.get("ActorIpAddress") or raw.get("ClientIPAddress") or "").strip("[]")
+              ip = re.sub(r":\d+$", "", ip) if ip.count(":") == 1 else ip
+              if op == "MailItemsAccessed":
+                  # Aggregated, never sent raw: user × IP × day × ClientAppId × MailAccessType.
+                  user = (e.get("user_id") or raw.get("UserId") or "").lower(); nip = norm(ip) if ip else ""
+                  if user and nip:
+                      mode = next((str(p.get("Value")) for p in raw.get("OperationProperties") or [] if p.get("Name") == "MailAccessType"), "")
+                      k = (user, nip, e["occurred_at"][:10], str(raw.get("ClientAppId") or "")[:100], mode[:40])
+                      a = agg_mail.get(k) or agg_mail.setdefault(k, {"count": 0, "first": e["occurred_at"], "last": e["occurred_at"], "ex": []})
+                      a["count"] += int(raw.get("OperationCount") or 1); a["first"] = min(a["first"], e["occurred_at"]); a["last"] = max(a["last"], e["occurred_at"]); add_example(a["ex"], ip)
+                  continue
+              if op in ("FileDownloaded", "FileSyncDownloadedFull"):
+                  user = (e.get("user_id") or raw.get("UserId") or "").lower(); nip = norm(ip) if ip else ""
+                  if user and nip:
+                      k = (user, nip, e["occurred_at"][:10])
+                      a = agg_dl.get(k) or agg_dl.setdefault(k, {"count": 0, "first": e["occurred_at"], "last": e["occurred_at"], "ex": [], "ua": set(), "sites": set(), "tool": False})
+                      ua = str(raw.get("UserAgent") or "")
+                      a["count"] += 1; a["first"] = min(a["first"], e["occurred_at"]); a["last"] = max(a["last"], e["occurred_at"]); add_example(a["ex"], ip)
+                      a["ua"].add(ua_family(ua)); a["tool"] = a["tool"] or bool(TOOL_UA.search(ua))
+                      if raw.get("SiteUrl") and len(a["sites"]) < 20: a["sites"].add(str(raw["SiteUrl"])[:500])
+                  continue
+              if op in ("UserLoggedIn", "UserLoginFailed"):
+                  user = (e.get("user_id") or raw.get("UserId") or "").lower()
+                  if user and ip:
+                      ua = next((p.get("Value") for p in raw.get("ExtendedProperties") or [] if p.get("Name") == "UserAgent"), None)
+                      nip = norm(ip)
+                      k = (user, nip); b = base.get(k)
+                      if not b: b = base[k] = {"user_id": user, "ip": nip, "first_seen": e["occurred_at"], "last_seen": e["occurred_at"], "success": 0, "failure": 0, "ua": set(), "err": set(), "ex": []}
+                      add_example(b["ex"], ip)
+                      b["first_seen"] = min(b["first_seen"], e["occurred_at"]); b["last_seen"] = max(b["last_seen"], e["occurred_at"])
+                      ok = op == "UserLoggedIn" and "fail" not in str(raw.get("ResultStatus", "")).lower()
+                      b["success" if ok else "failure"] += 1
+                      b["ua"].add(ua_family(ua or ""))
+                      err = raw.get("LogonError") or raw.get("ErrorNumber")
+                      if err: b["err"].add(str(err)[:20])
+                  if e["occurred_at"] < raw_cut: continue   # raw sign-ins only for the last 30 days
+                  if ip: raw["_ip"] = enrich(ip); raw["_ip_norm"] = norm(ip)
+              events.append({"record_type": e.get("record_type") or "", "operation": op, "user_id": e.get("user_id"), "workload": raw.get("Workload"),
+                             "client_ip": ip or None, "object_id": raw.get("ObjectId"), "occurred_at": e["occurred_at"], "raw": raw})
+
+          # ---- baseline (user × IP) ----
+          meta_ip = json.load(open(f"{work}/ipdb/meta.json"))
+          rows = []
+          for b in base.values():
+              i = enrich_key(b["ip"], b["ex"])
+              rows.append({"user_id": b["user_id"], "ip": b["ip"], "ip_examples": b["ex"][:5], "asn": str(i["asn"]) if i["asn"] else None, "as_name": i["as_name"], "country": i["country"], "is_hosting": i["hosting"], "is_vpn": i["vpn"], "is_tor": i["tor"], "is_mobile_carrier": i["mobile"],
+                           "ua_families": sorted(b["ua"])[:20], "error_codes": sorted(b["err"])[:20], "first_seen": b["first_seen"], "last_seen": b["last_seen"], "success": b["success"], "failure": b["failure"]})
+          for n, i in enumerate(range(0, max(len(rows), 1), 2000)):
+              send({"scan_id": scan_id, "source": "signin_baseline", "chunk": n + 1, "rows": rows[i:i+2000], **({"enrichment_meta": meta_ip} if n == 0 else {})})
+          print(f"Baseline: {len(rows)} Nutzer×IP-Zeilen")
+
+          # ---- MailItemsAccessed / download aggregates ----
+          def flags(i): return {"asn": str(i["asn"]) if i["asn"] else None, "as_name": i["as_name"], "country": i["country"], "is_hosting": i["hosting"], "is_vpn": i["vpn"], "is_tor": i["tor"], "is_mobile_carrier": i["mobile"]}
+          mail_rows = [{"user_id": k[0], "ip": k[1], "day": k[2], "client_app_id": k[3], "access_type": k[4], "count": a["count"], "first_seen": a["first"], "last_seen": a["last"], "ip_examples": a["ex"][:5], **flags(enrich_key(k[1], a["ex"]))} for k, a in agg_mail.items()]
+          dl_rows = [{"user_id": k[0], "ip": k[1], "day": k[2], "count": a["count"], "first_seen": a["first"], "last_seen": a["last"], "ip_examples": a["ex"][:5], "ua_families": sorted(a["ua"])[:20], "sites": sorted(a["sites"])[:20], "tool_ua": a["tool"], **flags(enrich_key(k[1], a["ex"]))} for k, a in agg_dl.items()]
+          for kind, rws in (("mailitems", mail_rows), ("downloads", dl_rows)):
+              for n, i in enumerate(range(0, max(len(rws), 1), 2000)):
+                  send({"scan_id": scan_id, "source": "ual_aggregates", "kind": kind, "chunk": n + 1, "rows": rws[i:i+2000]})
+              print(f"Aggregate {kind}: {len(rws)} Zeilen")
+
+          # ---- Exchange state ----
+          for path in sorted(glob.glob(f"{work}/exchange/*.json")):
+              st = json.load(open(path, encoding="utf-8-sig"))
+              data = st.get("data")
+              if isinstance(data, list):
+                  chunks = [data[i:i+2000] for i in range(0, len(data), 2000)] or [[]]
+                  for n, c in enumerate(chunks): send({"scan_id": scan_id, "source": "exchange_state", "kind": st["kind"], "data": c, "chunk": n + 1, "incomplete": bool(st.get("incomplete")), **({"note": st["note"][:1000]} if st.get("note") else {})})
+              else:
+                  send({"scan_id": scan_id, "source": "exchange_state", "kind": st["kind"], "data": data or {}, "chunk": 1, "incomplete": bool(st.get("incomplete"))})
+              print("Exchange:", st["kind"])
+
+          # ---- UAL events (last chunk sets status done) ----
+          meta = json.load(open(f"{work}/ual-meta.json", encoding="utf-8-sig"))
+          size = 500; total = len(events); chunks = max(1, -(-total // size))
+          for i in range(chunks):
+              send({"scan_id": scan_id, "status": "done" if i == chunks - 1 else "partial", "source": "ual", "chunk": i + 1, "total_chunks": chunks,
+                    "events": events[i*size:(i+1)*size], "window_start": meta.get("start"), "window_end": meta.get("end"),
+                    "incomplete_windows": (meta.get("incomplete") or []) if i == chunks - 1 else []})
+          print(f"UAL: {total} relevante Events in {chunks} Chunks übertragen")
           PY
 
       - name: Cleanup
         if: always()
-        run: |
-          rm -rf "$WORK" || true
+        run: rm -rf "$WORK" || true
