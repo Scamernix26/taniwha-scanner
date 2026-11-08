@@ -79,7 +79,7 @@ jobs:
           New-Item -ItemType Directory /w/tests -Force | Out-Null
           Set-Location /w/tests
           Install-MaesterTests -Path /w/tests
-          Invoke-Maester -Path /w/tests -OutputJsonFile /w/results.json -NonInteractive -SkipGraphConnect -DisableTelemetry | Out-Null
+          Invoke-Maester -Path /w/tests -OutputJsonFile /w/results.json -OutputHtmlFile /w/maester.html -NonInteractive -SkipGraphConnect -DisableTelemetry | Out-Null
           PS
           cat > "$WORK/ef.ps1" <<'PS'
           # EntraFalcon: separate process so a failure never affects the Maester result. Read-only Graph REST calls.
@@ -108,6 +108,12 @@ jobs:
               -d "$(jq -nc --arg s "$SCAN_ID" --arg n "Maester lieferte kein Ergebnis. $NOTE" '{scan_id:$s,status:"failed",note:$n}')"
             exit 1
           fi
+          # Upload the original HTML reports (gzip) before cleanup; failures never block the result callback.
+          ART="${CALLBACK%/m365-maester}/m365-artifact"
+          upload() { [ -s "$1" ] || return 0; gzip -9c "$1" > "$1.gz"; curl -sS -m 120 -X POST "$ART?scan_id=$SCAN_ID&kind=$2" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/gzip" --data-binary "@$1.gz" >/dev/null || echo "Upload $2 fehlgeschlagen"; }
+          upload "$WORK/maester.html" maester_html
+          EF_HTML=$(find "$WORK/ef" -maxdepth 3 -name '*EntraFalconEnumerationSummary*.html' 2>/dev/null | head -n1 || true)
+          [ -n "$EF_HTML" ] && upload "$EF_HTML" entrafalcon_html
           # Slim the result (drop large HTML/markdown blobs) and send it.
           CONN='{}'
           if [ -s "$WORK/connections.json" ]; then
