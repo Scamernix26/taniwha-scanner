@@ -307,11 +307,23 @@ jobs:
         run: |
           pip install --quiet --user maxminddb >/dev/null 2>&1 || true
           python3 - "$WORK" "$SCAN_ID" "$CALLBACK" "$INGEST" <<'PY'
-          import json, sys, os, glob, ipaddress, urllib.request, datetime, re
+          import json, sys, os, glob, ipaddress, urllib.request, urllib.error, datetime, re, time
           work, scan_id, callback, secret = sys.argv[1:5]
           def send(payload):
               req = urllib.request.Request(callback, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json", "Authorization": f"Bearer {secret}"})
-              with urllib.request.urlopen(req, timeout=180): pass
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(req, timeout=180): pass
+                      return
+                  except urllib.error.HTTPError as e:
+                      # Only safe diagnostic fields; never print payload or server response text.
+                      try: detail = json.loads(e.read())
+                      except Exception: detail = {}
+                      print("Übertragung fehlgeschlagen:", payload.get("source"), payload.get("kind"), e.code, detail.get("code", "unknown"))
+                      if e.code < 500 or attempt == 2: raise
+                  except urllib.error.URLError:
+                      if attempt == 2: raise
+                  time.sleep(2 ** attempt)
 
           # ---- offline IP enrichment ----
           mmdb = None
@@ -449,7 +461,8 @@ jobs:
               st = json.load(open(path, encoding="utf-8-sig"))
               data = st.get("data")
               if isinstance(data, list):
-                  chunks = [data[i:i+2000] for i in range(0, len(data), 2000)] or [[]]
+                  data = [x if isinstance(x, dict) else {"domainName" if st["kind"] == "accepted_domains" else "value": x} for x in data if x is not None and not isinstance(x, list)]
+                  chunks = [data[i:i+200] for i in range(0, len(data), 200)] or [[]]
                   for n, c in enumerate(chunks): send({"scan_id": scan_id, "source": "exchange_state", "kind": st["kind"], "data": c, "chunk": n + 1, "incomplete": bool(st.get("incomplete")), **({"note": st["note"][:1000]} if st.get("note") else {})})
               else:
                   send({"scan_id": scan_id, "source": "exchange_state", "kind": st["kind"], "data": data or {}, "chunk": 1, "incomplete": bool(st.get("incomplete"))})
@@ -465,6 +478,18 @@ jobs:
           print(f"UAL: {total} relevante Events in {chunks} Chunks übertragen")
           PY
 
+      - name: Report unsuccessful run
+        if: failure() || cancelled()
+        run: |
+          [[ "$SCAN_ID" =~ ^[0-9a-f-]{36}$ && "$CALLBACK" =~ ^https://[a-zA-Z0-9.-]+/api/public/m365-ual$ ]] || exit 1
+          curl --fail --retry 2 -sS -m 30 -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" \
+            -d "$(jq -nc --arg s "$SCAN_ID" '{scan_id:$s,status:"failed",note:"Runner-Auftrag abgebrochen oder Übertragung fehlgeschlagen. Teildaten bleiben erhalten; Audit-Log-Prüfung unvollständig."}')"
+
       - name: Cleanup
         if: always()
-        run: rm -rf "$WORK" || true
+        run: |
+          if [ -n "${WORK:-}" ] && [[ "$WORK" == /tmp/tmp.* ]]; then
+            docker rm -f "taniwha-ual-$SCAN_ID" >/dev/null 2>&1 || true
+            docker run --rm --entrypoint /usr/bin/find -v "$WORK:/w" mcr.microsoft.com/powershell:lts-ubuntu-22.04 /w -mindepth 1 -delete
+            rm -rf "$WORK"
+          fi
