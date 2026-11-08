@@ -110,7 +110,18 @@ jobs:
           fi
           # Upload the original HTML reports (gzip) before cleanup; failures never block the result callback.
           ART="${CALLBACK%/m365-maester}/m365-artifact"
-          upload() { [ -s "$1" ] || return 0; gzip -9c "$1" > "$1.gz"; curl -sS -m 120 -X POST "$ART?scan_id=$SCAN_ID&kind=$2" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/gzip" --data-binary "@$1.gz" >/dev/null || echo "Upload $2 fehlgeschlagen"; }
+          upload() {
+            [ -s "$1" ] || return 0
+            local packed
+            packed=$(mktemp "$WORK/report-XXXXXX.gz") || { echo "Verpacken $2 fehlgeschlagen"; return 0; }
+            if gzip -9c "$1" > "$packed"; then
+              curl --fail -sS -m 120 -X POST "$ART?scan_id=$SCAN_ID&kind=$2" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/gzip" --data-binary "@$packed" >/dev/null || echo "Upload $2 fehlgeschlagen"
+            else
+              echo "Verpacken $2 fehlgeschlagen; Befunde werden trotzdem übertragen"
+            fi
+            rm -f "$packed" || true
+            return 0
+          }
           upload "$WORK/maester.html" maester_html
           EF_HTML=$(find "$WORK/ef" -maxdepth 3 -name '*EntraFalconEnumerationSummary*.html' 2>/dev/null | head -n1 || true)
           [ -n "$EF_HTML" ] && upload "$EF_HTML" entrafalcon_html
@@ -121,3 +132,9 @@ jobs:
           fi
           jq -c --arg s "$SCAN_ID" --argjson c "$CONN" '{scan_id:$s,status:"done"} + $c + {results:{TenantId,ExecutedAt,CurrentVersion,Tests:[.Tests[]|{Name,Result,Tag,ErrorRecord:((.ErrorRecord//[])|map(tostring|.[0:500])),ResultDetail:{TestTitle:.ResultDetail.TestTitle,TestDescription:((.ResultDetail.TestDescription//"")|tostring|.[0:1200]),TestResult:((.ResultDetail.TestResult//"")|tostring|.[0:1200]),Severity:.ResultDetail.Severity,SkippedReason:((.ResultDetail.TestSkipped//.ResultDetail.SkippedReason//"")|tostring|.[0:300])}}]}}' "$WORK/results.json" | jq -c --slurpfile ef "$WORK/ef_payload.json" --arg en "$EF_NOTE" '. + {entrafalcon:$ef[0], entrafalcon_note:$en}' > "$WORK/payload.json"
           curl -sS -m 120 --fail -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" --data-binary "@$WORK/payload.json"
+      - name: Report unsuccessful run
+        if: failure() || cancelled()
+        run: |
+          [[ "$SCAN_ID" =~ ^[0-9a-f-]{36}$ && "$CALLBACK" =~ ^https://[a-z0-9.-]+/api/public/m365-maester$ ]] || exit 1
+          curl --fail --retry 2 -sS -m 30 -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" \
+            -d "$(jq -nc --arg s "$SCAN_ID" '{scan_id:$s,status:"failed",note:"Runner-Auftrag abgebrochen oder Ergebnisübertragung fehlgeschlagen. Gespeicherte Berichte bleiben abrufbar; Prüfung unvollständig."}')"
