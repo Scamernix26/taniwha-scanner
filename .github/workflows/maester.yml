@@ -132,6 +132,18 @@ jobs:
           fi
           jq -c --arg s "$SCAN_ID" --argjson c "$CONN" '{scan_id:$s,status:"done"} + $c + {results:{TenantId,ExecutedAt,CurrentVersion,Tests:[.Tests[]|{Name,Result,Tag,ErrorRecord:((.ErrorRecord//[])|map(tostring|.[0:500])),ResultDetail:{TestTitle:.ResultDetail.TestTitle,TestDescription:((.ResultDetail.TestDescription//"")|tostring|.[0:1200]),TestResult:((.ResultDetail.TestResult//"")|tostring|.[0:1200]),Severity:.ResultDetail.Severity,SkippedReason:((.ResultDetail.TestSkipped//.ResultDetail.SkippedReason//"")|tostring|.[0:300])}}]}}' "$WORK/results.json" | jq -c --slurpfile ef "$WORK/ef_payload.json" --arg en "$EF_NOTE" '. + {entrafalcon:$ef[0], entrafalcon_note:$en}' > "$WORK/payload.json"
           curl -sS -m 120 --fail -X POST "$CALLBACK" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" --data-binary "@$WORK/payload.json"
+          # SharePoint audit is isolated from Maester/PnP assembly loading and starts only after results were delivered.
+          # Plain read-only REST with the same certificate (no PnP); no new tenant permissions are granted.
+          SPO="${CALLBACK%/m365-maester}/m365-spo-audit"
+          if curl --fail -sS -m 30 "$SPO" -H "Authorization: Bearer $INGEST" -o "$WORK/spo.ps1"; then
+            if ! timeout 1800 docker run --rm --name "taniwha-sharepoint-$SCAN_ID" -v "$WORK:/w" \
+              -e CLIENT_ID -e TENANT_ID -e CERT_PW -e SCAN_ID -e CALLBACK -e INGEST \
+              mcr.microsoft.com/powershell:lts-ubuntu-22.04 pwsh -NoProfile -File /w/spo.ps1 >/dev/null 2>&1; then
+              docker rm -f "taniwha-sharepoint-$SCAN_ID" >/dev/null 2>&1 || true
+              curl --fail -sS -m 60 -X POST "$SPO" -H "Authorization: Bearer $INGEST" -H "Content-Type: application/json" \
+                -d "$(jq -nc --arg s "$SCAN_ID" --arg t "$TENANT_ID" '{scan_id:$s,tenant_id:$t,status:"failed",rows:[],note:"SharePoint-Admin-Erhebung fehlgeschlagen oder Zeitlimit erreicht; übertragene Teilresultate bleiben erhalten."}')" >/dev/null || true
+            fi
+          fi
       - name: Report unsuccessful run
         if: failure() || cancelled()
         run: |
